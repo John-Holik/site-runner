@@ -1,0 +1,7 @@
+question,choices,answer,why,difficulty,category
+"At what height does OSHA require fall protection in construction?",6 feet|10 feet|15 feet,6 feet,"Work at 6 ft or more requires fall protection",easy,FALL
+"You should never walk or stand…",Under a suspended load|Beside a barricade|Near the site office,Under a suspended load,"If rigging fails, everything under the load is in the strike zone",easy,STRUCK
+"Temporary power on site should run through…",GFCI protection|A bigger breaker|A splitter,GFCI protection,"GFCIs cut power fast when current leaks to ground",easy,ELEC
+"A trench 5 feet deep or more requires…","A protective system (sloping, shoring, or shielding)"|Nothing if entered briefly|A warning sign only,"A protective system (sloping, shoring, or shielding)","Never enter an unprotected trench",medium,CAUGHT
+"The PASS method for fire extinguishers is…","Pull, Aim, Squeeze, Sweep"|Push And Stand Still|Point At Smoke Source,"Pull, Aim, Squeeze, Sweep","Pull the pin, aim at the base, squeeze, sweep",easy,FIRE
+"In the hierarchy of controls, PPE is…",The last line of defense|The most effective control|A substitute for training,The last line of defense,"Eliminate hazards first; PPE limits what is left",easy,PPE

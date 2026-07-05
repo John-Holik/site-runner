@@ -1,0 +1,1385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Site Runner — ElectriAI Arcade</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0D1526;overflow:hidden;}
+  #game{width:100%;height:100%;display:flex;align-items:center;justify-content:center;}
+  canvas{outline:none;}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/phaser@3/dist/phaser.min.js"></script>
+</head>
+<body>
+<div id="game"></div>
+<script>
+'use strict';
+/* =========================================================================
+   SITE RUNNER — night-shift construction runner (ElectriAI Arcade)
+   Chrome-dino DNA + Grid Defense learning principles:
+   questions are the coin economy, mastery pips, CSV/JSON question upload,
+   HR-friendly hazard framing, education-psychology design language.
+   Single self-contained file; art generated at runtime; Phaser CDN only.
+   ========================================================================= */
+
+const W = 960, H = 540, GROUND = 470, PX = 170;
+const REDUCED = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* ---- design tokens (shared with grid-defense education pass) ---- */
+const C = {
+  bg:0x0D1526, bg2:0x111C33, panel:0x172642, panel2:0x1C2E52, line:0x2B3F66,
+  teal:0x2DD4BF, green:0x4ADE80, amber:0xFBBF24, violet:0xA78BFA,
+  coral:0xF87171, text:0xF1F5F9, muted:0x93A5C0,
+  orange:0xFB923C, hivis:0xA3E635, steel:0x94A3B8, steelD:0x64748B, dark:0x0A1120, ink:0x06231F
+};
+const S = {}; for (const k in C) S[k] = '#'+C[k].toString(16).padStart(6,'0');
+const F = { ui:'"Segoe UI", system-ui, sans-serif', mono:'Consolas, "Courier New", monospace' };
+
+/* ---- tunable balance ---- */
+const BAL = {
+  pxPerMeter: 10,
+  startSpeed: 280, engStartPerLvl: 4,      // px/s
+  maxSpeedBase: 460, engMaxPerLvl: 26,     // ENGINE raises top speed
+  rampBase: 0.5, rampPerThr: 0.06,         // px/s gained per meter (THROTTLE)
+  creep: 0.06,                             // px/s per meter of perpetual growth past the cap — it always gets faster
+  gravity: 1600, jumpVel: -640, fastFall: 2600,
+  hatsBase: 1,                             // free near-misses (PLATING adds)
+  invulnMs: 1200, slowmoMs: 500,
+  gateFirst: 400, gateStep: 100, gateMax: 800,     // checkpoint spacing (m)
+  gateGold: [12,16,20,24,28],              // coins per correct, by streak
+  coinRowMinM: 120, coinRowMaxM: 220, coinVal: 1,
+  distCoinPer: 200,                        // +1 coin per N meters at shift end
+  graceM: 120,                             // no obstacles before this
+  engMax: 10, thrMax: 10, platMax: 3,
+  engCost: l => Math.round(30*Math.pow(1.55,l)),
+  thrCost: l => Math.round(25*Math.pow(1.5,l)),
+  platCost: [120,360,1080],
+  masteryNeedMax: 4,
+  xpCorrect: 8, xpMaster: 20, xpGate: 2, xpPer100m: 1, xpBest: 25
+};
+
+/* ---- difficulty modes ---- */
+const DIFF_MODES = {
+  rookie:  {label:'ROOKIE',  speed:0.85, gap:1.3,  hats:1, coin:0.8,  blurb:'Slower site, extra hard hat, lighter pay.'},
+  crew:    {label:'CREW',    speed:1.0,  gap:1.0,  hats:0, coin:1.0,  blurb:'The standard shift.'},
+  veteran: {label:'VETERAN', speed:1.12, gap:0.8,  hats:0, coin:1.3,  blurb:'Fast and dense — bigger coin payouts.'}
+};
+const DIFF_ORDER = ['rookie','crew','veteran'];
+function diffMode(){ return DIFF_MODES[Profile.data.diff] || DIFF_MODES.crew; }
+
+/* ---- progression ---- */
+const RANKS = [[1,'Laborer'],[3,'Apprentice'],[5,'Journeyman'],[7,'Lead Hand'],[9,'Foreman'],[12,'Superintendent'],[15,'Site Manager'],[18,'Safety Director']];
+const xpTotalFor = l => 40*(l-1) + 18*(l-1)*(l-1);   // cumulative xp to REACH level l
+function levelFromXP(xp){ let l=1; while (xp >= xpTotalFor(l+1)) l++; return l; }
+function rankFor(level){ let r=RANKS[0][1]; for (const [lv,name] of RANKS) if (level>=lv) r=name; return r; }
+
+/* ---- vehicles (drawn, not loaded) ---- */
+const VEHICLES = [
+  {id:'dozer', name:'D9 Dozer',      cost:0,    unlock:1,  blurb:'Standard issue. Pushes through the night shift.'},
+  {id:'skid',  name:'Skid Steer',    cost:250,  unlock:2,  blurb:'Small frame, big attitude.'},
+  {id:'fork',  name:'Forklift',      cost:500,  unlock:3,  blurb:'Certified operators only.'},
+  {id:'dump',  name:'Dump Truck',    cost:900,  unlock:5,  blurb:'Hauls the payload — and the score.'},
+  {id:'mixer', name:'Cement Mixer',  cost:1400, unlock:7,  blurb:'Keeps the pour moving.'},
+  {id:'exc',   name:'Excavator',     cost:2000, unlock:9,  blurb:'Digs deep. Reaches far.'},
+  {id:'crane', name:'Crane Truck',   cost:3000, unlock:11, blurb:'Top of the lift plan.'}
+];
+
+/* ---- obstacles: every hazard has a right response (jump or duck) ---- */
+const OBS = [
+  {id:'cones',  kind:'jump', w:56,  h:34, minM:0,   tip:'Cones mark a hazard zone — respect the barricade.'},
+  {id:'barrier',kind:'jump', w:48,  h:36, minM:0,   tip:'Barriers protect the crew — never blow through one.'},
+  {id:'trench', kind:'jump', w:72,  h:10, minM:250, tip:'Open trench — protective systems required at 5 ft.'},
+  {id:'pallet', kind:'jump', w:56,  h:42, minM:400, tip:'Staged materials — keep travel paths clear.'},
+  {id:'pipes',  kind:'jump', w:62,  h:34, minM:600, tip:'Pipe stacks can roll — always chock round stock.'},
+  {id:'bar',    kind:'duck', w:92,  h:0,  minM:300, tip:'Low scaffold bar — watch overhead clearance.'},
+  {id:'duct',   kind:'duck', w:84,  h:0,  minM:500, tip:'Low duct run — hard-hat areas exist for a reason.'},
+  {id:'gantry', kind:'duck', w:100, h:0,  minM:800, tip:'Low clearance — check posted heights before entering.'}
+];
+const DUCK_BOTTOM = GROUND - 42;   // bottom edge of hanging obstacles
+
+/* ---- bundled sample question bank (construction safety / OSHA focus four) ---- */
+const SAMPLE_QUESTIONS = [
+ {question:"At what height does OSHA require fall protection in construction?", choices:["6 feet","10 feet","15 feet"], answer:"6 feet", why:"Work at 6 ft or more above a lower level requires fall protection.", difficulty:"easy", category:"FALL"},
+ {question:"How should you climb a ladder?", choices:["Maintain 3 points of contact","Carry tools in both hands","Face away from the ladder"], answer:"Maintain 3 points of contact", why:"Two hands + one foot (or two feet + one hand) on the ladder at all times.", difficulty:"easy", category:"FALL"},
+ {question:"The proper angle for an extension ladder is…", choices:["1 ft out for every 4 ft up","1 ft out for every 8 ft up","Flat against the wall"], answer:"1 ft out for every 4 ft up", why:"The 4-to-1 rule keeps the ladder from kicking out or tipping back.", difficulty:"medium", category:"FALL"},
+ {question:"A floor opening on site should be…", choices:["Covered and labeled, or guarded","Marked with a cone only","Left open if clearly visible"], answer:"Covered and labeled, or guarded", why:"Openings get covered or guarded — visibility alone never stopped a fall.", difficulty:"medium", category:"FALL"},
+ {question:"You should never walk or stand…", choices:["Under a suspended load","Beside a barricade","Near the site office"], answer:"Under a suspended load", why:"If the rigging fails, everything under the load is in the strike zone.", difficulty:"easy", category:"STRUCK"},
+ {question:"High-visibility clothing exists mainly so that…", choices:["Equipment operators can see you","You stay warm","Inspectors can find you"], answer:"Equipment operators can see you", why:"Most struck-by incidents involve an operator who never saw the worker.", difficulty:"easy", category:"STRUCK"},
+ {question:"When must a spotter be used?", choices:["When equipment backs up or the operator can't see","Only at night","Only on highways"], answer:"When equipment backs up or the operator can't see", why:"Blind spots and backing equipment call for a dedicated spotter.", difficulty:"medium", category:"STRUCK"},
+ {question:"Before entering an equipment swing radius you should…", choices:["Make eye contact and get the operator's signal","Move through quickly","Wave once and proceed"], answer:"Make eye contact and get the operator's signal", why:"Never assume the operator sees you — confirm it before you enter.", difficulty:"medium", category:"STRUCK"},
+ {question:"Never position yourself…", choices:["Between moving equipment and a fixed object","Behind a barricade","In a marked walkway"], answer:"Between moving equipment and a fixed object", why:"Caught-between incidents happen in the pinch point — stay out of it.", difficulty:"easy", category:"CAUGHT"},
+ {question:"A trench 5 feet deep or more requires…", choices:["A protective system (sloping, shoring, or shielding)","Nothing if entered briefly","A warning sign only"], answer:"A protective system (sloping, shoring, or shielding)", why:"Never enter an unprotected trench — soil collapses without warning.", difficulty:"medium", category:"CAUGHT"},
+ {question:"Loose clothing near rotating equipment is dangerous because…", choices:["It can be caught and pull you in","It looks unprofessional","It wears out faster"], answer:"It can be caught and pull you in", why:"Rotating parts grab loose clothing, hair, and jewelry — keep them clear.", difficulty:"medium", category:"CAUGHT"},
+ {question:"Temporary power on a construction site should run through…", choices:["GFCI protection","A bigger breaker","An extension cord splitter"], answer:"GFCI protection", why:"GFCIs cut power fast when current leaks to ground — that protects people.", difficulty:"easy", category:"ELEC"},
+ {question:"Lockout/tagout (LOTO) means…", choices:["De-energize and lock equipment before servicing it","Locking the gate at night","Tagging broken tools"], answer:"De-energize and lock equipment before servicing it", why:"Lock it, tag it, and verify zero energy before you touch it.", difficulty:"easy", category:"ELEC"},
+ {question:"Before working near overhead power lines you should…", choices:["Keep at least 10 feet of clearance","Touch the line to test it","Work fast and stay quiet"], answer:"Keep at least 10 feet of clearance", why:"Stay at least 10 ft from lines up to 50 kV — treat every line as live.", difficulty:"medium", category:"ELEC"},
+ {question:"A damaged extension cord on site should be…", choices:["Taken out of service immediately","Wrapped in tape","Used for light loads only"], answer:"Taken out of service immediately", why:"A damaged cord is a shock and fire hazard — remove it, don't patch it.", difficulty:"medium", category:"ELEC"},
+ {question:"Verifying zero energy after locking out means…", choices:["Testing the circuit with a meter before touching it","Trusting the lock","Asking a coworker"], answer:"Testing the circuit with a meter before touching it", why:"Test before touch — the lock proves intent, the meter proves it's dead.", difficulty:"hard", category:"ELEC"},
+ {question:"The PASS method for fire extinguishers is…", choices:["Pull, Aim, Squeeze, Sweep","Push And Stand Still","Point At Smoke Source"], answer:"Pull, Aim, Squeeze, Sweep", why:"Pull the pin, aim at the base, squeeze the handle, sweep side to side.", difficulty:"easy", category:"FIRE"},
+ {question:"A fire watch during hot work must continue…", choices:["During and after the work is done","Only while sparks are visible","Only if a fire starts"], answer:"During and after the work is done", why:"Smoldering starts late — keep the watch going after welding or cutting stops.", difficulty:"medium", category:"FIRE"},
+ {question:"In the hierarchy of controls, PPE is…", choices:["The last line of defense","The most effective control","A substitute for training"], answer:"The last line of defense", why:"Eliminate or engineer out hazards first; PPE only limits what's left.", difficulty:"easy", category:"PPE"},
+ {question:"A hard hat mainly protects you from…", choices:["Falling and swinging objects","Sunburn","Loud noise"], answer:"Falling and swinging objects", why:"Head protection is required wherever overhead work or loads exist.", difficulty:"easy", category:"PPE"},
+ {question:"The most effective control in the hierarchy of controls is…", choices:["Eliminating the hazard","Warning signs","PPE"], answer:"Eliminating the hazard", why:"A hazard that isn't there can't hurt anyone — elimination beats protection.", difficulty:"medium", category:"PPE"},
+ {question:"If you see an unsafe condition you should…", choices:["Stop work and report it","Ignore it if you're busy","Wait for the weekly meeting"], answer:"Stop work and report it", why:"Everyone on site has stop-work authority — use it.", difficulty:"easy", category:"GEN"},
+ {question:"Why report near-misses?", choices:["So hazards are fixed before someone gets hurt","To assign blame","For paperwork only"], answer:"So hazards are fixed before someone gets hurt", why:"Every near-miss is a free lesson — report it so the next one isn't a hit.", difficulty:"easy", category:"GEN"},
+ {question:"Good housekeeping on site prevents…", choices:["Slips, trips, and falls","Overtime","Deliveries"], answer:"Slips, trips, and falls", why:"Cords, debris, and spills cause most slip-and-trip incidents.", difficulty:"medium", category:"GEN"},
+ {question:"A 'competent person' on site is someone who…", choices:["Can identify hazards and has authority to correct them","Has the most seniority","Owns the tools"], answer:"Can identify hazards and has authority to correct them", why:"Competent = can spot the hazard AND is empowered to stop and fix it.", difficulty:"medium", category:"GEN"},
+ {question:"A toolbox talk is…", choices:["A short pre-task safety briefing","A tool inventory","A lunch break"], answer:"A short pre-task safety briefing", why:"A few minutes of planning before the task prevents the incident during it.", difficulty:"easy", category:"GEN"},
+ {question:"A ladder's side rails must extend above the landing by at least…", choices:["3 feet","6 inches","They can stop at the edge"], answer:"3 feet", why:"The 3-ft extension gives you a handhold while stepping on and off.", difficulty:"medium", category:"FALL"},
+ {question:"The top rail of a guardrail system should be about…", choices:["42 inches high","24 inches high","6 feet high"], answer:"42 inches high", why:"Top rail at 42 in (±3), midrail at 21 in — that's what stops a falling worker.", difficulty:"hard", category:"FALL"},
+ {question:"A personal fall arrest system consists of…", choices:["Anchor, full-body harness, and connector","A rope tied to your belt","A hard hat and gloves"], answer:"Anchor, full-body harness, and connector", why:"The ABCs of fall arrest: Anchorage, Body harness, Connector — all three, every time.", difficulty:"medium", category:"FALL"},
+ {question:"Scaffolds must be inspected…", choices:["By a competent person before each shift","Once when built","Only after an incident"], answer:"By a competent person before each shift", why:"Conditions change overnight — every shift starts with a scaffold inspection.", difficulty:"medium", category:"FALL"},
+ {question:"On a stepladder you should never stand on…", choices:["The top cap or top step","The second step","The middle steps"], answer:"The top cap or top step", why:"The top of a stepladder gives you nothing to hold — use a taller ladder instead.", difficulty:"easy", category:"FALL"},
+ {question:"A tag line is used to…", choices:["Control a suspended load from a safe distance","Mark the lunch area","Tie off a ladder"], answer:"Control a suspended load from a safe distance", why:"Guide the load with a rope — never with your hands on the load itself.", difficulty:"medium", category:"STRUCK"},
+ {question:"Equipment backing up on site must have…", choices:["A backup alarm or a spotter","Nothing if moving slowly","Hazard lights only"], answer:"A backup alarm or a spotter", why:"Backing equipment causes many struck-by deaths — alarm or spotter, no exceptions.", difficulty:"easy", category:"STRUCK"},
+ {question:"Tools used at height should be…", choices:["Tethered or secured against dropping","Balanced on the edge","Tossed down when done"], answer:"Tethered or secured against dropping", why:"A dropped wrench from a scaffold hits like a bullet — tether it or toe-board it.", difficulty:"medium", category:"STRUCK"},
+ {question:"Before a crane lift begins, workers on the ground should…", choices:["Clear the swing radius and load path","Gather to watch","Stand under the boom"], answer:"Clear the swing radius and load path", why:"Barricade the swing radius — nobody stands where the load or counterweight travels.", difficulty:"medium", category:"STRUCK"},
+ {question:"Excavated spoil piles must be kept at least…", choices:["2 feet from the trench edge","Right at the edge","10 inches from the edge"], answer:"2 feet from the trench edge", why:"Spoil at the edge adds weight and can fall back in — keep it 2 ft back minimum.", difficulty:"medium", category:"CAUGHT"},
+ {question:"Machine guards on equipment should be…", choices:["Kept in place whenever the machine runs","Removed for better access","Optional for experienced workers"], answer:"Kept in place whenever the machine runs", why:"Guards exist because hands are faster than reflexes — never run a machine without them.", difficulty:"easy", category:"CAUGHT"},
+ {question:"Before working under a raised dump bed or bucket you must…", choices:["Block or support it mechanically","Trust the hydraulics","Work quickly"], answer:"Block or support it mechanically", why:"Hydraulics fail without warning — physical blocking is the only trustworthy support.", difficulty:"medium", category:"CAUGHT"},
+ {question:"In a trench 4 feet or deeper, a ladder or exit must be within…", choices:["25 feet of every worker","100 feet","The trench doesn't need an exit"], answer:"25 feet of every worker", why:"If the soil moves you have seconds — a way out within 25 ft is the rule.", difficulty:"hard", category:"CAUGHT"},
+ {question:"A downed power line should be treated as…", choices:["Energized until the utility confirms otherwise","Dead if it isn't sparking","Safe after 10 minutes"], answer:"Energized until the utility confirms otherwise", why:"A line can be silent, still, and lethal — stay back and call the utility.", difficulty:"easy", category:"ELEC"},
+ {question:"Only who may work on energized electrical equipment?", choices:["Qualified persons with proper PPE and permits","Anyone with insulated gloves","The newest crew member"], answer:"Qualified persons with proper PPE and permits", why:"Energized work takes training, a permit, and arc-rated PPE — qualified persons only.", difficulty:"medium", category:"ELEC"},
+ {question:"A double-insulated tool is marked with…", choices:["A square-within-a-square symbol","A lightning bolt","A green dot"], answer:"A square-within-a-square symbol", why:"The double-square means two layers of insulation instead of a grounding conductor.", difficulty:"hard", category:"ELEC"},
+ {question:"Running an extension cord through a doorway is risky because…", choices:["The door can pinch and damage the insulation","It looks untidy","Cords are too short for that"], answer:"The door can pinch and damage the insulation", why:"Pinched cords fray inside where you can't see it — route cords through protected paths.", difficulty:"medium", category:"ELEC"},
+ {question:"Flammable liquids on site must be stored…", choices:["In approved safety cans and cabinets","In any spare bucket","Next to the welding area"], answer:"In approved safety cans and cabinets", why:"Approved containers control vapors and flame — that's what keeps fuel from becoming fire.", difficulty:"easy", category:"FIRE"},
+ {question:"The right extinguisher class for an electrical fire is…", choices:["Class C","Class A","Class K"], answer:"Class C", why:"Class C agents don't conduct — water on an energized fire electrocutes the operator.", difficulty:"medium", category:"FIRE"},
+ {question:"Smoking on a job site is allowed…", choices:["Only in designated areas away from flammables","Anywhere outdoors","Near the fuel storage if careful"], answer:"Only in designated areas away from flammables", why:"Designated smoking areas keep ignition sources away from fuels and vapors.", difficulty:"easy", category:"FIRE"},
+ {question:"A practical sign that hearing protection is needed is…", choices:["Having to shout to be heard at arm's length","Seeing dust in the air","Feeling warm"], answer:"Having to shout to be heard at arm's length", why:"If normal speech fails at arm's length, you're near or past the protection threshold.", difficulty:"medium", category:"PPE"},
+ {question:"Damaged or worn PPE should be…", choices:["Replaced immediately","Used until payday","Shared with a coworker"], answer:"Replaced immediately", why:"PPE is the last line of defense — damaged gear protects nobody.", difficulty:"easy", category:"PPE"},
+ {question:"Safety-toe boots mainly protect against…", choices:["Crushing and rolling objects","Cold weather","Electric shock"], answer:"Crushing and rolling objects", why:"The reinforced toe stops dropped materials and wheel rollovers from crushing your foot.", difficulty:"easy", category:"PPE"},
+ {question:"A safety data sheet (SDS) tells you…", choices:["A chemical's hazards, handling, and first aid","The project schedule","Equipment rental rates"], answer:"A chemical's hazards, handling, and first aid", why:"Before using any chemical, the SDS is where its hazards and emergency steps live.", difficulty:"medium", category:"GEN"},
+ {question:"When the site emergency alarm sounds, you should…", choices:["Stop work and go to the muster point","Finish your task first","Hide until it stops"], answer:"Stop work and go to the muster point", why:"Head count at the muster point is how the site knows everyone got out.", difficulty:"easy", category:"GEN"}
+];
+
+/* ---- small utils ---- */
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+const rand = (a,b)=>a+Math.random()*(b-a);
+const irand = (a,b)=>Math.floor(rand(a,b+1));
+const pick = a=>a[(Math.random()*a.length)|0];
+const fmt = n=>Math.round(n).toLocaleString('en-US');
+function shuffle(a){ a=a.slice(); for(let i=a.length-1;i>0;i--){const j=(Math.random()*(i+1))|0; [a[i],a[j]]=[a[j],a[i]];} return a; }
+function qKey(q){ const s=(q.question||'').toLowerCase().replace(/\s+/g,' ').trim(); let h=5381; for(let i=0;i<s.length;i++) h=((h*33)^s.charCodeAt(i))>>>0; return h.toString(36); }
+
+/* ---- storage (fails soft if localStorage unavailable) ---- */
+const Store = {
+  mem:{},
+  get(k){ try { return localStorage.getItem(k); } catch(e){ return this.mem[k]||null; } },
+  set(k,v){ try { localStorage.setItem(k,v); } catch(e){ this.mem[k]=v; } },
+  del(k){ try { localStorage.removeItem(k); } catch(e){ delete this.mem[k]; } }
+};
+
+/* ---- player profile ---- */
+const PROFILE_KEY = 'siterunner.profile.v1';
+const Profile = {
+  data: null,
+  fresh(){ return {v:1, xp:0, coins:0, eng:0, thr:0, plat:0, owned:['dozer'], vehicle:'dozer', best:0, mute:false, theme:'night', diff:'crew',
+    stats:{runs:0, meters:0, coins:0, qa:0, qc:0, byCat:{}}, mastery:{}}; },
+  load(){
+    let d = null;
+    try { d = JSON.parse(Store.get(PROFILE_KEY)); } catch(e){}
+    this.data = Object.assign(this.fresh(), d||{});
+    this.data.stats = Object.assign(this.fresh().stats, (d&&d.stats)||{});
+    if (!this.data.owned.includes('dozer')) this.data.owned.push('dozer');
+    if (!this.data.owned.includes(this.data.vehicle)) this.data.vehicle = 'dozer';
+    return this.data;
+  },
+  save(){ Store.set(PROFILE_KEY, JSON.stringify(this.data)); },
+  level(){ return levelFromXP(this.data.xp); },
+  rank(){ return rankFor(this.level()); },
+  addXP(n){ const before=this.level(); this.data.xp+=n; return this.level()>before; },
+  hatsMax(){ return BAL.hatsBase + this.data.plat; },
+  startSpeed(){ return BAL.startSpeed + BAL.engStartPerLvl*this.data.eng; },
+  maxSpeed(){ return BAL.maxSpeedBase + BAL.engMaxPerLvl*this.data.eng; },
+  ramp(){ return BAL.rampBase + BAL.rampPerThr*this.data.thr; },
+  masteredCount(bank){ let n=0; for (const q of bank) { const m=this.data.mastery[qKey(q)]; if (m&&m.m) n++; } return n; }
+};
+
+/* ---- question mastery (Quizlet-style, persisted; survives bank re-uploads) ---- */
+function recordAnswer(q, correct){
+  const k = qKey(q);
+  const M = Profile.data.mastery;
+  const m = M[k] || (M[k] = {s:0, need:2, m:false, a:0, c:0});
+  m.a++;
+  let newlyMastered = false;
+  if (correct){
+    m.c++; m.s++;
+    if (!m.m && m.s >= m.need){ m.m = true; newlyMastered = true; }
+  } else {
+    m.s = 0; m.m = false; m.need = Math.min(BAL.masteryNeedMax, m.need+1);
+  }
+  const cat = (q.category||'GEN').toUpperCase();
+  const st = Profile.data.stats;
+  st.qa++; if (correct) st.qc++;
+  const bc = st.byCat[cat] || (st.byCat[cat] = {a:0,c:0});
+  bc.a++; if (correct) bc.c++;
+  return newlyMastered;
+}
+
+/* ---- question bank: bundled sample or uploaded CSV/JSON (localStorage) ---- */
+const BANK_KEY = 'siterunner.questions.v1';
+const Bank = {
+  active(){
+    try {
+      const d = JSON.parse(Store.get(BANK_KEY));
+      if (d && Array.isArray(d.questions) && d.questions.length >= 5) return d;
+    } catch(e){}
+    return {src:'bundled sample', ts:0, questions:SAMPLE_QUESTIONS};
+  },
+  install(questions, src){ Store.set(BANK_KEY, JSON.stringify({src, ts:Date.now(), questions})); },
+  reset(){ Store.del(BANK_KEY); },
+  isCustom(){ try { const d=JSON.parse(Store.get(BANK_KEY)); return !!(d&&d.questions); } catch(e){ return false; } }
+};
+
+/* ---- upload parsing & validation (schema: question, choices, answer, +optional why/difficulty/skin/category/id) ---- */
+function parseCSV(text){
+  const rows=[]; let row=[], cur='', inQ=false;
+  for (let i=0;i<text.length;i++){
+    const ch=text[i];
+    if (inQ){ if (ch==='"'){ if (text[i+1]==='"'){cur+='"';i++;} else inQ=false; } else cur+=ch; }
+    else if (ch==='"') inQ=true;
+    else if (ch===','){ row.push(cur); cur=''; }
+    else if (ch==='\n' || ch==='\r'){ if (ch==='\r'&&text[i+1]==='\n') i++; row.push(cur); if (row.some(c=>c.trim()!=='')) rows.push(row); row=[]; cur=''; }
+    else cur+=ch;
+  }
+  row.push(cur); if (row.some(c=>c.trim()!=='')) rows.push(row);
+  return rows;
+}
+function validateRows(raw){
+  // raw: array of plain objects with lowercase keys
+  const ok=[], skipped=[];
+  const DIFF=['easy','medium','hard'], SKIN=['theory','onboarding','both'];
+  raw.forEach((r,i)=>{
+    const n=i+1;
+    const fail=reason=>skipped.push({n, reason});
+    const question=(r.question||'').toString().trim();
+    if (!question) return fail('question is empty');
+    let choices = r.choices;
+    if (typeof choices === 'string') choices = choices.split('|');
+    if (!Array.isArray(choices)) return fail('choices missing');
+    choices = choices.map(c=>c.toString().trim()).filter(c=>c!=='');
+    if (choices.length<2 || choices.length>6) return fail('needs 2–6 choices');
+    const folded = choices.map(c=>c.toLowerCase());
+    if (new Set(folded).size !== folded.length) return fail('duplicate choice text');
+    const answer=(r.answer||'').toString().trim();
+    const ai = folded.indexOf(answer.toLowerCase());
+    if (ai<0) return fail("answer doesn't match any choice");
+    let difficulty=(r.difficulty||'').toString().trim().toLowerCase();
+    if (difficulty && !DIFF.includes(difficulty)) return fail('invalid difficulty "'+difficulty+'"');
+    let skin=(r.skin||'').toString().trim().toLowerCase();
+    if (skin && !SKIN.includes(skin)) return fail('invalid skin "'+skin+'"');
+    ok.push({
+      question, choices, answer:choices[ai],
+      why:(r.why||'').toString().trim(),
+      difficulty: difficulty||'medium',
+      category:(r.category||'').toString().trim().toUpperCase()||'GEN',
+      id:(r.id||'').toString().trim()||undefined
+    });
+  });
+  return {ok, skipped};
+}
+function parseQuestionFile(name, text){
+  // returns {ok, skipped, error}
+  const isJSON = /\.json$/i.test(name) || text.trim().startsWith('[') || text.trim().startsWith('{');
+  try {
+    if (isJSON){
+      let d = JSON.parse(text);
+      if (d && Array.isArray(d.questions)) d = d.questions;
+      if (!Array.isArray(d)) return {error:'JSON must be an array of questions (or {"questions":[…]})'};
+      const raw = d.map(o=>{ const r={}; for (const k in o) r[k.toLowerCase()]=o[k]; return r; });
+      return validateRows(raw);
+    }
+    const rows = parseCSV(text);
+    if (rows.length < 2) return {error:'CSV needs a header row plus at least one question row'};
+    const head = rows[0].map(h=>h.trim().toLowerCase());
+    if (!head.includes('question')) return {error:'CSV header must include a "question" column'};
+    const raw = rows.slice(1).map(cells=>{ const r={}; head.forEach((h,i)=>r[h]=cells[i]!==undefined?cells[i]:''); return r; });
+    return validateRows(raw);
+  } catch(e){ return {error:'File could not be parsed: '+e.message}; }
+}
+const TEMPLATE_CSV = 'question,choices,answer,why,difficulty,category\n'
+ + '"At what height does OSHA require fall protection in construction?",6 feet|10 feet|15 feet,6 feet,"Work at 6 ft or more requires fall protection",easy,FALL\n'
+ + '"You should never walk or stand…",Under a suspended load|Beside a barricade|Near the site office,Under a suspended load,"If rigging fails, everything under the load is in the strike zone",easy,STRUCK\n'
+ + '"Temporary power on site should run through…",GFCI protection|A bigger breaker|A splitter,GFCI protection,"GFCIs cut power fast when current leaks to ground",easy,ELEC\n'
+ + '"A trench 5 feet deep or more requires…","A protective system (sloping, shoring, or shielding)"|Nothing if entered briefly|A warning sign only,"A protective system (sloping, shoring, or shielding)","Never enter an unprotected trench",medium,CAUGHT\n'
+ + '"The PASS method for fire extinguishers is…","Pull, Aim, Squeeze, Sweep"|Push And Stand Still|Point At Smoke Source,"Pull, Aim, Squeeze, Sweep","Pull the pin, aim at the base, squeeze, sweep",easy,FIRE\n'
+ + '"In the hierarchy of controls, PPE is…",The last line of defense|The most effective control|A substitute for training,The last line of defense,"Eliminate hazards first; PPE limits what is left",easy,PPE\n';
+
+/* ---- question drawing pool (per run) ---- */
+function makeSession(){ return {correct:new Set(), recent:[]}; }
+function nextQuestion(gateIdx, sess){
+  const qs = Bank.active().questions;
+  let cand = qs.filter(q=>!sess.correct.has(qKey(q)));
+  if (!cand.length){ sess.correct.clear(); cand = qs.slice(); }
+  const c2 = cand.filter(q=>!sess.recent.includes(qKey(q)));
+  if (c2.length) cand = c2;
+  const unm = cand.filter(q=>{ const m=Profile.data.mastery[qKey(q)]; return !(m&&m.m); });
+  if (unm.length) cand = unm;
+  const hasTags = qs.some(q=>q.difficulty && q.difficulty!=='medium');
+  if (hasTags){
+    const pref = gateIdx<2 ? ['easy','medium','hard'] : gateIdx<4 ? ['medium','easy','hard'] : ['medium','hard','easy'];
+    for (const p of pref){ const f=cand.filter(q=>(q.difficulty||'medium')===p); if (f.length){ cand=f; break; } }
+  }
+  const q = pick(cand);
+  sess.recent.push(qKey(q)); if (sess.recent.length>2) sess.recent.shift();
+  return q;
+}
+
+/* ---- audio: tiny synthesized beeps (WebAudio), mute persisted ---- */
+const Snd = {
+  ctx:null,
+  ensure(){ if (!this.ctx){ try { this.ctx = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){} } if (this.ctx&&this.ctx.state==='suspended') this.ctx.resume(); },
+  beep(f0, dur, type='sine', vol=0.14, f1){
+    if (Profile.data.mute) return; this.ensure(); if (!this.ctx) return;
+    const t = this.ctx.currentTime, o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t);
+    if (f1) o.frequency.exponentialRampToValueAtTime(f1, t+dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+    o.connect(g); g.connect(this.ctx.destination); o.start(t); o.stop(t+dur+0.02);
+  },
+  click(){ this.beep(330, 0.06, 'square', 0.06); },
+  jump(){ this.beep(300, 0.16, 'sine', 0.1, 560); },
+  coin(){ this.beep(880, 0.09, 'square', 0.07, 1320); },
+  ok(){ this.beep(523, 0.12, 'sine', 0.12, 659); setTimeout(()=>this.beep(784,0.16,'sine',0.1),90); },
+  no(){ this.beep(220, 0.22, 'sawtooth', 0.06, 160); },
+  hit(){ this.beep(110, 0.2, 'square', 0.12, 70); },
+  buy(){ this.beep(660, 0.1, 'sine', 0.1, 880); },
+  level(){ [523,659,784,1046].forEach((f,i)=>setTimeout(()=>this.beep(f,0.14,'sine',0.1), i*90)); },
+  over(){ this.beep(392, 0.3, 'sine', 0.1, 262); }
+};
+
+/* ---- generic UI helpers ---- */
+function T(scene, x, y, s, size, color, opts={}){
+  return scene.add.text(x, y, s, Object.assign({fontFamily:F.ui, fontSize:size+'px', color:color, resolution:2}, opts));
+}
+function setupCam(scene){ scene.cameras.main.setZoom(2); scene.cameras.main.centerOn(W/2, H/2); }
+function themeSfx(){ return Profile.data.theme === 'day' ? '_day' : '_night'; }
+function makePanel(scene, x, y, w, h, opts={}){
+  const g = scene.add.graphics();
+  g.fillStyle(opts.fill!==undefined?opts.fill:C.panel, opts.alpha!==undefined?opts.alpha:1);
+  g.fillRoundedRect(x, y, w, h, opts.r!==undefined?opts.r:14);
+  g.lineStyle(1.5, opts.line!==undefined?opts.line:C.line, 1);
+  g.strokeRoundedRect(x, y, w, h, opts.r!==undefined?opts.r:14);
+  return g;
+}
+function makeBtn(scene, x, y, w, h, label, onClick, opts={}){
+  const kind = opts.kind||'ghost';
+  const P = {
+    primary:{f:C.teal,  fh:0x5EEAD4, t:S.ink,   line:null},
+    amber:  {f:C.amber, fh:0xFCD34D, t:'#231703', line:null},
+    violet: {f:C.violet,fh:0xC4B5FD, t:'#1B1233', line:null},
+    ghost:  {f:C.panel, fh:0x21335A, t:S.text,  line:C.line},
+    danger: {f:C.panel, fh:0x21335A, t:S.coral, line:C.line}
+  }[kind];
+  const ct = scene.add.container(x, y);
+  const g = scene.add.graphics();
+  const draw = fill=>{
+    g.clear(); g.fillStyle(fill,1); g.fillRoundedRect(-w/2,-h/2,w,h,10);
+    if (P.line!==null){ g.lineStyle(1.5,P.line,1); g.strokeRoundedRect(-w/2,-h/2,w,h,10); }
+  };
+  draw(P.f);
+  const t = T(scene, 0, 0, label, opts.size||Math.round(h*0.38), P.t, {fontStyle:opts.bold===false?'':'bold'}).setOrigin(0.5);
+  ct.add([g,t]);
+  ct.setSize(w,h);
+  ct.setInteractive({useHandCursor:true});
+  ct.enabled = true;
+  ct.on('pointerover', ()=>{ if (ct.enabled) draw(P.fh); });
+  ct.on('pointerout', ()=>draw(P.f));
+  ct.on('pointerup', ()=>{ if (!ct.enabled) return; Snd.click(); onClick(); });
+  ct.setLabel = s=>t.setText(s);
+  ct.setEnabled = b=>{ ct.enabled=b; ct.setAlpha(b?1:0.4); };
+  ct.labelObj = t;
+  return ct;
+}
+function coinIcon(scene, x, y, scale=1){ return scene.add.image(x, y, 'coin').setScale(scale*0.5); }
+
+/* ---- file helpers (upload) ---- */
+let fileInput = null;
+function pickFile(cb){
+  if (!fileInput){ fileInput=document.createElement('input'); fileInput.type='file'; fileInput.accept='.csv,.json'; fileInput.style.display='none'; document.body.appendChild(fileInput); }
+  fileInput.onchange = ()=>{ const f=fileInput.files[0]; fileInput.value=''; if (f) cb(f); };
+  fileInput.click();
+}
+function readFile(f, cb){ const r=new FileReader(); r.onload=()=>cb(r.result); r.readAsText(f); }
+function handleQuestionFile(f, summaryCb){
+  readFile(f, text=>{
+    const res = parseQuestionFile(f.name, text);
+    if (res.error){ summaryCb('Could not load: '+res.error, false); return; }
+    let msg = 'Loaded '+res.ok.length+' questions from '+f.name;
+    if (res.skipped.length) msg += '\nSkipped '+res.skipped.length+':\n' + res.skipped.slice(0,4).map(s=>'  row '+s.n+' — '+s.reason).join('\n') + (res.skipped.length>4 ? '\n  …and '+(res.skipped.length-4)+' more' : '');
+    if (res.ok.length < 5){ summaryCb('Only '+res.ok.length+' valid questions (need at least 5) — keeping the current bank.\n'+msg, false); return; }
+    Bank.install(res.ok, f.name);
+    summaryCb(msg + '\nThis bank is now active.', true);
+  });
+}
+function downloadTemplate(){
+  const blob = new Blob([TEMPLATE_CSV], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'site-runner-questions-template.csv'; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+}
+window.addEventListener('dragover', e=>e.preventDefault());
+window.addEventListener('drop', e=>{
+  e.preventDefault();
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f && window.__dropHandler) window.__dropHandler(f);
+});
+
+/* =========================================================================
+   BOOT — generate every texture (nothing is loaded), then Menu
+   ========================================================================= */
+class BootScene extends Phaser.Scene {
+  constructor(){ super('Boot'); }
+  create(){
+    const g = this.add.graphics();
+    let SS = 1;   // texture supersample: backgrounds render 1x, foreground art 2x (crisp at camera zoom 2)
+    const gen = (key,w,h)=>{ g.generateTexture(key, w*SS, h*SS); g.clear(); if (SS>1) g.scaleCanvas(SS,SS); };
+    // banded vertical gradient (fillGradientStyle does not survive generateTexture's canvas path)
+    const grad = (c0,c1,x,y,w2,h2,steps=28)=>{
+      const r0=(c0>>16)&255, g0=(c0>>8)&255, b0=c0&255, r1=(c1>>16)&255, g1=(c1>>8)&255, b1=c1&255;
+      for (let i=0;i<steps;i++){
+        const t=i/(steps-1);
+        const col=(Math.round(r0+(r1-r0)*t)<<16)|(Math.round(g0+(g1-g0)*t)<<8)|Math.round(b0+(b1-b0)*t);
+        g.fillStyle(col,1); g.fillRect(x, y+h2*i/steps, w2, Math.ceil(h2/steps)+1);
+      }
+    };
+
+    /* ---- backgrounds: night + day variants ---- */
+    for (const day of [true,false]){
+      const sfx = day ? '_day' : '_night';
+
+      /* sky */
+      if (day){
+        grad(0x74B3E4, 0xC7E5F6, 0, 0, W, H);
+        g.fillStyle(0xFDE68A,0.3); g.fillCircle(790,86,42);
+        g.fillStyle(0xFDE68A,1);  g.fillCircle(790,86,26);
+        g.fillStyle(0xFFFFFF,0.8);
+        for (const [cx,cy,s] of [[180,90,1],[420,150,0.8],[640,70,0.7]]){
+          g.fillCircle(cx,cy,20*s); g.fillCircle(cx+22*s,cy+4*s,15*s); g.fillCircle(cx-22*s,cy+5*s,14*s);
+        }
+      } else {
+        grad(0x0D1526, 0x14213D, 0, 0, W, H);
+        for (let i=0;i<70;i++){ g.fillStyle(0xF1F5F9, rand(0.08,0.4)); g.fillRect(rand(0,W), rand(0,300), 2, 2); }
+        g.fillStyle(0xE2E8F0,0.9); g.fillCircle(790,86,26);
+        g.fillStyle(0x111C33,1);  g.fillCircle(800,78,22);
+      }
+      gen('sky'+sfx,W,H);
+
+      /* skyline (tile 480x180) */
+      const bldC = day ? 0x94ACC2 : 0x0A1120;
+      g.fillStyle(bldC,1);
+      const bld=[[0,60,64],[70,30,110],[140,80,52],[200,10,150],[260,66,70],[336,40,96],[400,84,60],[440,50,90]];
+      for (const [x,y,w2] of bld) g.fillRect(x,y,w2,180-y);
+      for (let i=0;i<46;i++){
+        if (day) g.fillStyle(0x6E88A3, rand(0.3,0.6));
+        else g.fillStyle(Math.random()<0.7?0xFBBF24:0x2DD4BF, rand(0.15,0.5));
+        g.fillRect(rand(4,470), rand(40,160), 2, 3);
+      }
+      g.lineStyle(3,bldC,1); g.lineBetween(210,10,210,150); g.lineBetween(150,34,300,34); g.lineBetween(210,10,286,34); g.lineBetween(210,44,166,34);
+      g.fillStyle(0xF87171,0.8); g.fillRect(209,6,4,4);
+      gen('skyline'+sfx,480,180);
+
+      /* mid scaffolds (tile 480x160) — string lights at night only */
+      g.lineStyle(4, day?0xA9BCD0:0x14213A, 1);
+      for (let x=20;x<480;x+=110){ g.lineBetween(x,160,x,40); g.lineBetween(x+70,160,x+70,40); g.lineBetween(x-6,40,x+76,40); g.lineBetween(x,110,x+70,70); g.lineBetween(x,70,x+70,110); }
+      if (!day) for (let x=0;x<=480;x+=8){ const yy = 26 + Math.sin(x/480*Math.PI*2)*6 + 8*Math.sin(x/70); g.fillStyle(0xFBBF24, 0.5); if (x%24===0) g.fillCircle(x,yy+3,2); g.fillStyle(0x1E293B,1); g.fillRect(x,yy,2,1); }
+      gen('mid'+sfx,480,160);
+
+      /* fence (tile 240x80) */
+      const postC = day?0x5A6B85:0x1B2A4A, chainC = day?0x7E93A9:0x233457;
+      g.lineStyle(3,postC,1);
+      for (let x=6;x<240;x+=60) g.lineBetween(x,80,x,14);
+      g.lineStyle(1,chainC,0.9);
+      for (let x=-20;x<260;x+=14){ g.lineBetween(x,16,x+40,76); g.lineBetween(x+40,16,x,76); }
+      g.lineStyle(3,postC,1); g.lineBetween(0,14,240,14); g.lineBetween(0,76,240,76);
+      g.fillStyle(0xFB923C, day?0.9:0.75); for (let x=0;x<240;x+=30) g.fillRect(x,42,18,6);
+      gen('fence'+sfx,240,80);
+
+      /* road (tile 240x70) — brighter rim for object contrast */
+      g.fillStyle(day?0x46566F:0x101A2E,1); g.fillRect(0,0,240,70);
+      g.fillStyle(day?0x64789A:0x3B5378,1); g.fillRect(0,0,240,3);
+      g.fillStyle(0xFBBF24, day?0.75:0.55); for (let x=0;x<240;x+=60) g.fillRect(x,32,28,4);
+      for (let i=0;i<26;i++){ g.fillStyle(day?0x394A63:0x1A2742, rand(0.4,1)); g.fillRect(rand(0,236), rand(8,66), rand(2,5), 2); }
+      gen('road'+sfx,240,70);
+    }
+
+    /* everything from here renders at 2x for crispness */
+    SS = 2; g.scaleCanvas(2,2);
+
+    /* coin = hex nut */
+    (()=>{ const cx=11, cy=11, r=10, pts=[];
+      for (let i=0;i<6;i++){ const a=Math.PI/6 + i*Math.PI/3; pts.push({x:cx+r*Math.cos(a), y:cy+r*Math.sin(a)}); }
+      g.fillStyle(0xFBBF24,1); g.fillPoints(pts,true);
+      g.fillStyle(0xB45309,1); g.fillCircle(cx,cy,4.2);
+      g.fillStyle(0xFDE68A,0.85); g.fillRect(5,4,7,2);
+      gen('coin',22,22); })();
+
+    /* hard hat */
+    g.fillStyle(0xFBBF24,1);
+    g.fillRoundedRect(4,5,18,10,{tl:9,tr:9,bl:0,br:0});
+    g.fillRoundedRect(0,14,26,5,2);
+    g.fillStyle(0xFDE68A,0.9); g.fillRect(11,3,4,12);
+    gen('hat',26,20);
+
+    /* checkpoint arch */
+    g.fillStyle(0x0F766E,1); g.fillRect(2,220,12,10); g.fillRect(116,220,12,10);
+    g.fillStyle(0x2DD4BF,1); g.fillRect(4,26,8,198); g.fillRect(118,26,8,198);
+    g.fillStyle(0x172642,1); g.fillRoundedRect(0,20,130,36,8);
+    g.lineStyle(2,0x2DD4BF,1); g.strokeRoundedRect(0,20,130,36,8);
+    gen('gate',130,232);
+
+    /* ---- vehicles ---- */
+    const wheel=(x,y,r)=>{ g.fillStyle(0x0F172A,1); g.fillCircle(x,y,r); g.fillStyle(0x334155,1); g.fillCircle(x,y,r*0.55); g.fillStyle(0x64748B,1); g.fillCircle(x,y,r*0.22); };
+    const track=(x,y,w2,h2)=>{ g.fillStyle(0x0F172A,1); g.fillRoundedRect(x,y,w2,h2,h2/2); g.fillStyle(0x334155,1); const n=Math.max(2,Math.floor(w2/16)); for (let i=0;i<n;i++) g.fillCircle(x+h2/2+i*(w2-h2)/(n-1), y+h2/2, h2*0.28); };
+    const win=(x,y,w2,h2)=>{ g.fillStyle(0x0E2A3F,1); g.fillRect(x,y,w2,h2); g.fillStyle(0x2DD4BF,0.35); g.fillRect(x+1,y+1,w2-2,(h2-2)*0.45); };
+    const beacon=(x,y)=>{ g.fillStyle(0x94A3B8,1); g.fillRect(x-4,y,8,2); g.fillStyle(0xFBBF24,1); g.fillRoundedRect(x-3,y-6,6,6,2); };
+    const stripe=(x,y,w2)=>{ g.fillStyle(0xA3E635,0.9); g.fillRect(x,y,w2,3); };
+
+    /* dozer */
+    track(10,38,66,16);
+    g.fillStyle(0xFACC15,1); g.fillRoundedRect(12,20,52,20,3); stripe(14,33,46);
+    g.fillStyle(0xEAB308,1); g.fillRoundedRect(30,6,26,16,3); win(34,9,13,10);
+    g.fillStyle(0x64748B,1); g.fillRect(20,8,4,12);
+    g.fillStyle(0x64748B,1); g.fillRect(60,26,10,4);
+    g.fillStyle(0x94A3B8,1); g.fillPoints([{x:66,y:20},{x:76,y:24},{x:80,y:40},{x:80,y:54},{x:70,y:54},{x:66,y:38}],true);
+    beacon(50,6);
+    gen('veh_dozer',88,56);
+
+    /* skid steer */
+    wheel(26,46,9); wheel(56,46,9);
+    g.fillStyle(0xF97316,1); g.fillRoundedRect(14,26,50,20,4); stripe(16,36,40);
+    g.fillStyle(0xEA580C,1); g.fillRoundedRect(24,10,26,18,3); win(28,13,14,12);
+    g.fillStyle(0x64748B,1); g.fillPoints([{x:54,y:14},{x:62,y:12},{x:74,y:38},{x:66,y:42}],true);
+    g.fillStyle(0x94A3B8,1); g.fillPoints([{x:66,y:40},{x:86,y:40},{x:82,y:52},{x:66,y:52}],true);
+    beacon(37,10);
+    gen('veh_skid',88,56);
+
+    /* forklift */
+    wheel(28,46,9); wheel(54,46,8);
+    g.fillStyle(0xFB923C,1); g.fillRoundedRect(16,28,44,18,4); stripe(18,38,36);
+    g.fillStyle(0xC2410C,1); g.fillRect(12,30,8,14);
+    g.fillStyle(0x475569,1); g.fillRect(26,8,3,22); g.fillRect(48,8,3,22); g.fillRect(24,6,30,4);
+    g.fillStyle(0x334155,1); g.fillRect(32,20,12,8);
+    g.fillStyle(0x94A3B8,1); g.fillRect(62,4,5,48);
+    g.fillStyle(0x64748B,1); g.fillRect(68,10,3,42);
+    g.fillStyle(0xCBD5E1,1); g.fillRect(68,50,20,3);
+    beacon(39,6);
+    gen('veh_fork',88,56);
+
+    /* dump truck */
+    g.fillStyle(0x1E293B,1); g.fillRect(10,42,72,6);
+    wheel(22,47,9); wheel(40,47,9); wheel(66,47,9);
+    g.fillStyle(0x94A3B8,1); g.fillPoints([{x:8,y:16},{x:50,y:18},{x:54,y:42},{x:10,y:42}],true);
+    g.lineStyle(2,0x64748B,1); g.lineBetween(18,20,20,40); g.lineBetween(30,19,32,41); g.lineBetween(42,20,44,41);
+    g.fillStyle(0xF59E0B,1); g.fillRoundedRect(54,20,26,22,{tl:8,tr:4,bl:0,br:0}); win(60,24,16,10); stripe(55,36,24);
+    beacon(67,18);
+    gen('veh_dump',88,56);
+
+    /* cement mixer */
+    g.fillStyle(0x1E293B,1); g.fillRect(10,42,70,6);
+    wheel(20,47,8); wheel(36,47,8); wheel(64,47,9);
+    g.fillStyle(0x475569,1); g.fillRect(14,34,36,8);
+    g.fillStyle(0xCBD5E1,1); g.fillCircle(31,24,16);
+    g.lineStyle(4,0x2DD4BF,1); g.lineBetween(21,15,27,33); g.lineBetween(33,11,39,31);
+    g.fillStyle(0x64748B,1); g.fillCircle(47,28,4);
+    g.fillStyle(0x14B8A6,1); g.fillRoundedRect(56,20,24,22,{tl:8,tr:4,bl:0,br:0}); win(62,24,14,10); stripe(57,36,22);
+    beacon(68,18);
+    gen('veh_mixer',88,56);
+
+    /* excavator */
+    track(12,40,58,14);
+    g.fillStyle(0x475569,1); g.fillRect(8,26,8,12);
+    g.fillStyle(0xFBBF24,1); g.fillRoundedRect(12,22,42,18,3); stripe(14,34,38);
+    g.fillStyle(0xD97706,1); g.fillRoundedRect(14,6,20,18,3); win(17,9,12,12);
+    g.lineStyle(7,0xD97706,1); g.lineBetween(50,26,70,8); g.lineBetween(70,8,84,24);
+    g.fillStyle(0x94A3B8,1); g.fillPoints([{x:82,y:22},{x:88,y:26},{x:84,y:36},{x:78,y:28}],true);
+    beacon(24,4);
+    gen('veh_exc',88,56);
+
+    /* crane truck */
+    g.fillStyle(0x1E293B,1); g.fillRect(8,40,74,8);
+    wheel(20,46,8); wheel(36,46,8); wheel(64,46,8);
+    g.fillStyle(0x334155,1); g.fillRect(8,34,58,8);
+    g.fillStyle(0x94A3B8,1); g.fillPoints([{x:10,y:34},{x:18,y:34},{x:60,y:12},{x:55,y:8}],true);
+    g.lineStyle(1.5,0x475569,1); g.lineBetween(20,30,28,26); g.lineBetween(30,26,38,22); g.lineBetween(40,22,48,17);
+    g.lineStyle(2,0xCBD5E1,1); g.lineBetween(58,11,58,20);
+    g.fillStyle(0xFBBF24,1); g.fillCircle(58,22,3);
+    g.fillStyle(0xA3E635,1); g.fillRoundedRect(60,18,22,22,{tl:8,tr:4,bl:0,br:0}); win(66,22,12,10);
+    beacon(71,16);
+    gen('veh_crane',88,56);
+
+    /* ---- obstacles ---- */
+    /* cones */
+    const cone=(x)=>{ g.fillStyle(0xFB923C,1); g.fillTriangle(x,34,x+18,34,x+9,5); g.fillStyle(0xF1F5F9,0.9); g.fillRect(x+4,19,10,4); g.fillStyle(0xEA580C,1); g.fillRect(x-2,32,22,4); };
+    cone(2); cone(34);
+    gen('obs_cones',58,36);
+
+    /* water barrier */
+    g.fillStyle(0xF97316,1); g.fillRoundedRect(2,4,44,32,{tl:10,tr:10,bl:3,br:3});
+    g.fillStyle(0xF1F5F9,0.85); g.fillRect(10,10,8,24); g.fillRect(28,10,8,24);
+    g.fillStyle(0xC2410C,1); g.fillRect(0,33,48,3);
+    gen('obs_barrier',48,36);
+
+    /* trench (pit sits below grade) */
+    g.fillStyle(0x060B14,1); g.fillRect(2,12,68,16);
+    g.fillStyle(0x94A3B8,1); g.fillRect(0,10,72,3);
+    g.fillStyle(0x64748B,1); g.fillRect(0,0,5,14); g.fillRect(67,0,5,14);
+    g.fillStyle(0xFBBF24,1); g.fillRect(2,3,68,4);
+    g.fillStyle(0x111827,1); for (let x=6;x<66;x+=16) g.fillRect(x,3,8,4);
+    gen('obs_trench',72,28);
+
+    /* pallet of blocks */
+    g.fillStyle(0xB08040,1); g.fillRect(0,36,56,4); g.fillRect(4,40,6,4); g.fillRect(25,40,6,4); g.fillRect(46,40,6,4);
+    g.fillStyle(0xC3D0DF,1); g.fillRect(5,16,22,20); g.fillRect(29,16,22,20);
+    g.fillStyle(0x64748B,1); g.fillRect(5,26,22,2); g.fillRect(29,26,22,2);
+    g.fillStyle(0xE2E8F0,1); g.fillRect(14,2,28,14);
+    g.fillStyle(0x64748B,1); g.fillRect(14,9,28,2);
+    g.fillStyle(0xFB923C,0.95); g.fillRect(5,20,46,4);
+    gen('obs_pallet',56,44);
+
+    /* pipe stack */
+    const pipe=(x,y)=>{ g.fillStyle(0x8FA3B8,1); g.fillCircle(x,y,11); g.fillStyle(0x28354A,1); g.fillCircle(x,y,7); g.lineStyle(2,0xE2E8F0,1); g.strokeCircle(x,y,11); };
+    pipe(15,25); pipe(37,25); pipe(26,12);
+    g.fillStyle(0xFB923C,1); g.fillTriangle(48,36,58,36,58,26);
+    gen('obs_pipes',62,38);
+
+    /* hanging: scaffold bar */
+    g.fillStyle(0x64748B,1); g.fillRect(6,0,6,DUCK_BOTTOM-12); g.fillRect(80,0,6,DUCK_BOTTOM-12);
+    for (let x=0;x<92;x+=20){ g.fillStyle((x/20)%2===0?0xFBBF24:0x111827,1); g.fillRect(x,DUCK_BOTTOM-12,Math.min(20,92-x),12); }
+    g.fillStyle(0xCBD5E1,1); g.fillCircle(9,DUCK_BOTTOM-6,7); g.fillCircle(83,DUCK_BOTTOM-6,7);
+    gen('obs_bar',92,DUCK_BOTTOM);
+
+    /* hanging: duct run */
+    g.fillStyle(0x64748B,1); g.fillRect(15,0,4,DUCK_BOTTOM-26); g.fillRect(65,0,4,DUCK_BOTTOM-26);
+    g.fillStyle(0x8FA3B8,1); g.fillRect(0,DUCK_BOTTOM-26,84,26);
+    g.fillStyle(0x64748B,1); for (let x=20;x<84;x+=21) g.fillRect(x,DUCK_BOTTOM-26,3,26);
+    g.fillStyle(0xE2E8F0,0.8); g.fillRect(0,DUCK_BOTTOM-26,84,4);
+    g.fillStyle(0xFBBF24,1); g.fillRect(34,DUCK_BOTTOM-18,16,10);
+    gen('obs_duct',84,DUCK_BOTTOM);
+
+    /* hanging: low-clearance gantry */
+    g.fillStyle(0x64748B,1); for (let y=0;y<DUCK_BOTTOM-32;y+=10){ g.fillRect(11,y,3,6); g.fillRect(86,y,3,6); }
+    g.fillStyle(0xFBBF24,1); g.fillRect(0,DUCK_BOTTOM-32,100,32);
+    g.lineStyle(6,0x111827,1);
+    g.lineBetween(4,DUCK_BOTTOM-4,26,DUCK_BOTTOM-28); g.lineBetween(74,DUCK_BOTTOM-28,96,DUCK_BOTTOM-4);
+    g.fillStyle(0x111827,1); g.fillRect(34,DUCK_BOTTOM-22,32,12);
+    gen('obs_gantry',100,DUCK_BOTTOM);
+
+    g.destroy();
+    Profile.load();
+    this.scene.start('Menu');
+  }
+}
+
+/* =========================================================================
+   MENU — vehicle preview, garage, training yard, stats, upload
+   ========================================================================= */
+class MenuScene extends Phaser.Scene {
+  constructor(){ super('Menu'); }
+  create(){
+    setupCam(this);
+    const TH = themeSfx(), day = TH==='_day';
+    this.add.image(0,0,'sky'+TH).setOrigin(0);
+    this.far  = this.add.tileSprite(0,190,W,180,'skyline'+TH).setOrigin(0);
+    this.mid  = this.add.tileSprite(0,250,W,160,'mid'+TH).setOrigin(0).setAlpha(day?0.75:0.55);
+    this.fen  = this.add.tileSprite(0,GROUND-80,W,80,'fence'+TH).setOrigin(0);
+    this.road = this.add.tileSprite(0,GROUND,W,70,'road'+TH).setOrigin(0);
+
+    T(this, 60, 36, 'SITE RUNNER', 46, S.text, {fontStyle:'bold', stroke:S.dark, strokeThickness:day?5:0});
+    const chip = this.add.graphics(); chip.fillStyle(C.amber,1); chip.fillRoundedRect(388,48,110,24,6);
+    T(this, 443, 60, day?'DAY SHIFT':'NIGHT SHIFT', 13, '#231703', {fontStyle:'bold'}).setOrigin(0.5);
+    T(this, 62, 92, 'Run the site. Clear the hazards. Know your safety.', 15, day?S.text:S.muted, {stroke:S.dark, strokeThickness:day?3:0});
+    T(this, W-24, 18, 'ElectriAI Arcade', 12, day?S.text:S.muted, {stroke:S.dark, strokeThickness:day?3:0}).setOrigin(1,0);
+
+    /* vehicle preview */
+    makePanel(this, 70, 140, 300, 280, {fill:C.panel, alpha:0.92});
+    this.prevVeh   = this.add.image(220, 330, 'veh_dozer').setOrigin(0.5,1).setScale(1.05);
+    this.prevBeacon= this.add.circle(220, 190, 5, C.amber).setAlpha(0.9);
+    if (!REDUCED) this.tweens.add({targets:this.prevBeacon, alpha:0.15, duration:600, yoyo:true, repeat:-1});
+    this.prevName  = T(this, 220, 344, '', 20, S.text, {fontStyle:'bold'}).setOrigin(0.5,0);
+    this.prevBlurb = T(this, 220, 372, '', 13, S.muted, {wordWrap:{width:260}, align:'center'}).setOrigin(0.5,0);
+    makeBtn(this, 100, 250, 40, 40, '<', ()=>this.cycleVeh(-1));
+    makeBtn(this, 340, 250, 40, 40, '>', ()=>this.cycleVeh(1));
+    makeBtn(this, 220, 452, 190, 42, 'GARAGE', ()=>this.openGarage());
+
+    /* right stack */
+    makeBtn(this, 690, 190, 310, 62, 'START SHIFT', ()=>{ Snd.ensure(); this.scene.start('Play', {}); }, {kind:'primary', size:23});
+    makeBtn(this, 690, 256, 310, 44, 'TRAINING YARD', ()=>this.openTraining());
+    makeBtn(this, 690, 306, 310, 44, 'UPLOAD QUESTIONS', ()=>this.openUpload());
+    makeBtn(this, 690, 356, 310, 44, 'STATS', ()=>this.openStats());
+    this.diffBtn = makeBtn(this, 690, 406, 310, 40, '', ()=>{
+      const i = DIFF_ORDER.indexOf(Profile.data.diff);
+      Profile.data.diff = DIFF_ORDER[(i+1) % DIFF_ORDER.length];
+      Profile.save(); this.refresh();
+    }, {size:13});
+    this.diffNote = T(this, 690, 430, '', 11, day?S.text:S.muted, {stroke:S.dark, strokeThickness:3}).setOrigin(0.5,0);
+    this.sndBtn = makeBtn(this, 609, 470, 148, 38, '', ()=>{ Profile.data.mute=!Profile.data.mute; Profile.save(); this.refresh(); }, {size:13});
+    makeBtn(this, 771, 470, 148, 38, day?'THEME: DAY':'THEME: NIGHT', ()=>{
+      Profile.data.theme = day?'night':'day'; Profile.save(); this.scene.restart();
+    }, {size:13});
+
+    T(this, 300, H-58, 'SPACE / TAP RIGHT — JUMP   ·   DOWN / HOLD LEFT — DUCK   ·   P — PAUSE', 11, day?S.text:S.muted, {stroke:S.dark, strokeThickness:day?3:0}).setOrigin(0.5);
+
+    /* bottom bar */
+    const bar = this.add.graphics(); bar.fillStyle(C.bg2,0.9); bar.fillRect(0,H-44,W,44); bar.lineStyle(1,C.line,1); bar.lineBetween(0,H-44,W,H-44);
+    this.lvText = T(this, 20, H-31, '', 14, S.violet, {fontStyle:'bold'});
+    this.xpBarBg = this.add.graphics();
+    this.coinImg = coinIcon(this, 500, H-22, 0.8);
+    this.coinText = T(this, 514, H-31, '', 15, S.amber, {fontFamily:F.mono, fontStyle:'bold'});
+    this.bestText = T(this, W-22, H-31, '', 14, S.muted, {fontFamily:F.mono}).setOrigin(1,0);
+
+    this.overlay = null;
+    this.input.keyboard.on('keydown-ESC', ()=>{ if (this.overlay) this.closeOverlay(); });
+    this.input.keyboard.on('keydown-ENTER', ()=>{ if (!this.overlay){ Snd.ensure(); this.scene.start('Play', {}); } });
+    this.events.on('shutdown', ()=>{ window.__dropHandler = null; });
+    this.refresh();
+  }
+  update(){
+    this.far.tilePositionX += 0.06; this.mid.tilePositionX += 0.14;
+    this.fen.tilePositionX += 0.3;  this.road.tilePositionX += 0.4;
+  }
+  refresh(){
+    const p = Profile.data, lv = Profile.level();
+    const v = VEHICLES.find(v=>v.id===p.vehicle);
+    this.prevVeh.setTexture('veh_'+v.id);
+    this.prevName.setText(v.name);
+    this.prevBlurb.setText(v.blurb);
+    this.lvText.setText('LV '+lv+' · '+Profile.rank());
+    const cur=xpTotalFor(lv), next=xpTotalFor(lv+1), pct=clamp((p.xp-cur)/(next-cur),0,1);
+    this.xpBarBg.clear();
+    this.xpBarBg.fillStyle(C.line,1); this.xpBarBg.fillRoundedRect(190,H-28,160,8,4);
+    this.xpBarBg.fillStyle(C.violet,1); this.xpBarBg.fillRoundedRect(190,H-28,Math.max(8,160*pct),8,4);
+    this.coinText.setText(fmt(p.coins));
+    this.bestText.setText('BEST '+fmt(p.best)+' m');
+    this.sndBtn.setLabel('SOUND: '+(p.mute?'OFF':'ON'));
+    const D = diffMode();
+    this.diffBtn.setLabel('DIFFICULTY: '+D.label);
+    this.diffNote.setText(D.blurb);
+  }
+  cycleVeh(dir){
+    const owned = VEHICLES.filter(v=>Profile.data.owned.includes(v.id));
+    let i = owned.findIndex(v=>v.id===Profile.data.vehicle);
+    i = (i+dir+owned.length)%owned.length;
+    Profile.data.vehicle = owned[i].id; Profile.save(); this.refresh();
+  }
+
+  /* ---- overlays ---- */
+  openOverlay(build){
+    this.closeOverlay();
+    const ct = this.add.container(0,0).setDepth(50);
+    const dim = this.add.rectangle(W/2,H/2,W,H,C.dark,0.74).setInteractive();
+    ct.add(dim);
+    build(ct);
+    this.overlay = ct;
+  }
+  closeOverlay(){ if (this.overlay){ this.overlay.destroy(); this.overlay=null; window.__dropHandler=null; } }
+  addClose(ct, x, y){ const b = makeBtn(this, x, y, 40, 40, 'X', ()=>this.closeOverlay(), {kind:'danger'}); ct.add(b); return b; }
+
+  openGarage(){
+    this.openOverlay(ct=>{
+      ct.add(makePanel(this, 30, 46, 900, 458, {fill:C.bg2, alpha:0.98}));
+      ct.add(T(this, 56, 66, 'GARAGE', 24, S.text, {fontStyle:'bold'}));
+      ct.add(T(this, 56, 96, 'Every rig runs the same site — pick the one that feels like yours.', 13, S.muted));
+      ct.add(coinIcon(this, 806, 80, 0.9));
+      ct.add(T(this, 822, 71, fmt(Profile.data.coins), 17, S.amber, {fontFamily:F.mono, fontStyle:'bold'}));
+      this.addClose(ct, 898, 78);
+      const p = Profile.data, lv = Profile.level();
+      VEHICLES.forEach((v,i)=>{
+        const cx = 52 + (i%4)*218, cy = 126 + Math.floor(i/4)*186;
+        ct.add(makePanel(this, cx, cy, 200, 172, {fill:C.panel}));
+        const locked = lv < v.unlock;
+        const img = this.add.image(cx+100, cy+92, 'veh_'+v.id).setOrigin(0.5,1).setScale(0.725);
+        if (locked) img.setAlpha(0.28);
+        ct.add(img);
+        ct.add(T(this, cx+100, cy+100, v.name, 15, locked?S.muted:S.text, {fontStyle:'bold'}).setOrigin(0.5,0));
+        const by = cy+144;
+        if (locked){
+          ct.add(T(this, cx+100, by, 'LOCKED — REACH LV '+v.unlock, 13, S.muted, {fontStyle:'bold'}).setOrigin(0.5));
+        } else if (!p.owned.includes(v.id)){
+          const afford = p.coins >= v.cost;
+          const b = makeBtn(this, cx+100, by, 150, 34, 'BUY  '+fmt(v.cost), ()=>{
+            if (Profile.data.coins < v.cost) return;
+            Profile.data.coins -= v.cost; Profile.data.owned.push(v.id); Profile.data.vehicle = v.id;
+            Profile.save(); Snd.buy(); this.refresh(); this.openGarage();
+          }, {kind:'amber'});
+          if (!afford) b.setEnabled(false);
+          ct.add(b);
+        } else if (p.vehicle === v.id){
+          const b = makeBtn(this, cx+100, by, 150, 34, 'SELECTED', ()=>{}, {kind:'primary'}); b.setEnabled(false); b.setAlpha(1);
+          ct.add(b);
+        } else {
+          ct.add(makeBtn(this, cx+100, by, 150, 34, 'SELECT', ()=>{ Profile.data.vehicle=v.id; Profile.save(); this.refresh(); this.openGarage(); }));
+        }
+      });
+    });
+  }
+
+  openTraining(){
+    this.openOverlay(ct=>{
+      ct.add(makePanel(this, 90, 60, 780, 420, {fill:C.bg2, alpha:0.98}));
+      ct.add(T(this, 118, 82, 'TRAINING YARD', 24, S.text, {fontStyle:'bold'}));
+      ct.add(T(this, 118, 112, 'Train your rig between shifts — the Duck Life way. Coins come mostly from checkpoint questions.', 13, S.muted));
+      ct.add(coinIcon(this, 746, 96, 0.9));
+      ct.add(T(this, 762, 87, fmt(Profile.data.coins), 17, S.amber, {fontFamily:F.mono, fontStyle:'bold'}));
+      this.addClose(ct, 838, 92);
+      const p = Profile.data;
+      const rows = [
+        {key:'eng', name:'ENGINE', max:BAL.engMax, lvl:p.eng, cost:BAL.engCost(p.eng),
+         desc:'Raises top speed — meters and coins come faster.\nTop speed now: '+(Profile.maxSpeed()/BAL.pxPerMeter).toFixed(1)+' m/s'},
+        {key:'thr', name:'THROTTLE', max:BAL.thrMax, lvl:p.thr, cost:BAL.thrCost(p.thr),
+         desc:'Reaches top speed sooner after each checkpoint.\nRamp-up now: +'+(Profile.ramp()*10).toFixed(1)+' m/s per 100 m'},
+        {key:'plat', name:'PLATING', max:BAL.platMax, lvl:p.plat, cost:p.plat<BAL.platMax?BAL.platCost[p.plat]:0,
+         desc:'Extra hard hats — each one absorbs a near-miss.\nHard hats at shift start: '+(BAL.hatsBase+p.plat)}
+      ];
+      rows.forEach((r,i)=>{
+        const y = 168 + i*88;
+        ct.add(T(this, 122, y-14, r.name, 18, S.teal, {fontStyle:'bold', fontFamily:F.mono}));
+        ct.add(T(this, 122, y+12, r.desc, 12, S.muted, {lineSpacing:3}));
+        const pg = this.add.graphics(); ct.add(pg);
+        for (let k=0;k<r.max;k++){
+          const px2 = 428 + k*20;
+          if (k < r.lvl){ pg.fillStyle(C.teal,1); pg.fillRoundedRect(px2, y-8, 14, 26, 3); }
+          else { pg.lineStyle(1.5,C.line,1); pg.strokeRoundedRect(px2, y-8, 14, 26, 3); }
+        }
+        if (r.lvl >= r.max){
+          const b = makeBtn(this, 762, y+5, 130, 40, 'MAX', ()=>{}); b.setEnabled(false); ct.add(b);
+        } else {
+          const b = makeBtn(this, 762, y+5, 130, 40, 'TRAIN  '+fmt(r.cost), ()=>{
+            if (Profile.data.coins < r.cost) return;
+            Profile.data.coins -= r.cost; Profile.data[r.key]++;
+            Profile.save(); Snd.level(); this.refresh(); this.openTraining();
+          }, {kind:'amber', size:14});
+          if (p.coins < r.cost) b.setEnabled(false);
+          ct.add(b);
+        }
+      });
+      ct.add(T(this, 480, 448, 'Correct checkpoint answers also restore a hard hat mid-run — knowledge is protection.', 12, S.green).setOrigin(0.5));
+    });
+  }
+
+  openStats(){
+    this.openOverlay(ct=>{
+      ct.add(makePanel(this, 130, 60, 700, 420, {fill:C.bg2, alpha:0.98}));
+      ct.add(T(this, 158, 82, 'SITE RECORD', 24, S.text, {fontStyle:'bold'}));
+      this.addClose(ct, 798, 92);
+      const p = Profile.data, st = p.stats;
+      const bank = Bank.active().questions;
+      const acc = st.qa ? Math.round(100*st.qc/st.qa) : 0;
+      const rowsL = [
+        ['Rank', 'LV '+Profile.level()+' · '+Profile.rank()],
+        ['Shifts run', fmt(st.runs)],
+        ['Total distance', fmt(st.meters)+' m'],
+        ['Best shift', fmt(p.best)+' m'],
+        ['Coins earned (lifetime)', fmt(st.coins)],
+        ['Questions answered', fmt(st.qa)],
+        ['Correct', fmt(st.qc)+'  ('+acc+'%)'],
+        ['Mastered (active bank)', Profile.masteredCount(bank)+' / '+bank.length]
+      ];
+      rowsL.forEach(([k,v],i)=>{
+        ct.add(T(this, 158, 128+i*34, k, 14, S.muted));
+        ct.add(T(this, 470, 128+i*34, v, 14, S.text, {fontFamily:F.mono, fontStyle:'bold'}).setOrigin(1,0));
+      });
+      ct.add(T(this, 520, 128, 'BY CATEGORY', 13, S.teal, {fontFamily:F.mono, fontStyle:'bold'}));
+      const cats = Object.entries(st.byCat).sort((a,b)=>b[1].a-a[1].a).slice(0,8);
+      if (!cats.length) ct.add(T(this, 520, 156, 'Answer checkpoint questions\nto build your record.', 13, S.muted, {lineSpacing:4}));
+      cats.forEach(([cat,d],i)=>{
+        const pc = d.a ? Math.round(100*d.c/d.a) : 0;
+        ct.add(T(this, 520, 156+i*28, cat, 13, S.text, {fontFamily:F.mono}));
+        ct.add(T(this, 790, 156+i*28, d.c+'/'+d.a+'  '+pc+'%', 13, pc>=70?S.green:S.amber, {fontFamily:F.mono}).setOrigin(1,0));
+      });
+    });
+  }
+
+  openUpload(){
+    this.openOverlay(ct=>{
+      ct.add(makePanel(this, 100, 60, 760, 420, {fill:C.bg2, alpha:0.98}));
+      ct.add(T(this, 128, 82, 'UPLOAD QUESTIONS', 24, S.text, {fontStyle:'bold'}));
+      this.addClose(ct, 828, 92);
+      ct.add(T(this, 128, 122,
+        'Upload a .csv or .json question bank — it replaces the active bank and is kept across reloads.\n' +
+        'Required columns: question, choices (separate options with | ), answer (exact text of the correct choice).\n' +
+        'Optional: why, difficulty (easy/medium/hard), category. Minimum 5 valid questions.', 13, S.muted, {lineSpacing:5}));
+      const b = Bank.active();
+      const active = T(this, 128, 208, 'Active bank: '+b.src+' — '+b.questions.length+' questions', 14, S.teal, {fontFamily:F.mono});
+      ct.add(active);
+      const summary = T(this, 128, 354, '', 12, S.muted, {fontFamily:F.mono, lineSpacing:3, wordWrap:{width:704}});
+      ct.add(summary);
+      const report = (msg, ok)=>{
+        summary.setText(msg).setColor(ok?S.green:S.coral);
+        const nb = Bank.active();
+        active.setText('Active bank: '+nb.src+' — '+nb.questions.length+' questions');
+        if (ok) Snd.ok(); else Snd.no();
+      };
+      ct.add(makeBtn(this, 214, 252, 172, 44, 'CHOOSE FILE', ()=>pickFile(f=>handleQuestionFile(f, report)), {kind:'primary', size:15}));
+      ct.add(makeBtn(this, 434, 252, 226, 44, 'DOWNLOAD TEMPLATE', ()=>downloadTemplate(), {size:14}));
+      ct.add(makeBtn(this, 682, 252, 200, 44, 'RESET TO SAMPLE', ()=>{ Bank.reset(); report('Restored the bundled sample bank ('+SAMPLE_QUESTIONS.length+' questions).', true); }, {kind:'danger', size:14}));
+      ct.add(makeBtn(this, 302, 302, 348, 40, 'OPEN INSTRUCTOR TOOL', ()=>{ try { window.open('instructor.html','_blank'); } catch(e){} }, {kind:'violet', size:14}));
+      ct.add(T(this, 660, 292, 'Write and edit questions in a full\nauthoring app, then install them here.', 11, S.muted, {lineSpacing:2}));
+      ct.add(T(this, 480, 330, '…or drag a file anywhere onto this window.', 12, S.muted).setOrigin(0.5,0));
+      window.__dropHandler = f=>handleQuestionFile(f, report);
+    });
+  }
+}
+
+/* =========================================================================
+   PLAY — the night shift
+   ========================================================================= */
+class PlayScene extends Phaser.Scene {
+  constructor(){ super('Play'); }
+  init(data){ this.sys.settings.data = {}; }   // Phaser reuses last start() payload — wipe it
+  create(){
+    const p = Profile.data;
+    this.state = 'run';   // run | question | count | pause | over
+    this.D = diffMode();
+    this.dist = 0; this.meters = 0;
+    this.speed = Profile.startSpeed() * this.D.speed;
+    this.maxHats = Profile.hatsMax() + this.D.hats; this.hats = this.maxHats;
+    this.coinsGates = 0; this.coinsPickups = 0;
+    this.qa = 0; this.qc = 0; this.streak = 0; this.bestStreak = 0; this.masteredRun = 0;
+    this.xpAns = 0; this.xpMast = 0;
+    this.sess = makeSession();
+    this.gateIdx = 0; this.nextGateM = BAL.gateFirst; this.gateSpacing = BAL.gateFirst; this.gateSpawnedFor = -1;
+    this.nextObsDist = BAL.graceM * BAL.pxPerMeter;
+    this.nextCoinDist = 70 * BAL.pxPerMeter;
+    this.invulnUntil = 0; this.slowUntil = 0;
+    this.obstacles = []; this.coinsArr = []; this.gates = [];
+
+    /* background */
+    setupCam(this);
+    const TH = themeSfx(), day = TH==='_day';
+    this.add.image(0,0,'sky'+TH).setOrigin(0);
+    this.far  = this.add.tileSprite(0,190,W,180,'skyline'+TH).setOrigin(0);
+    this.midL = this.add.tileSprite(0,250,W,160,'mid'+TH).setOrigin(0).setAlpha(day?0.75:0.55);
+    this.fen  = this.add.tileSprite(0,GROUND-80,W,80,'fence'+TH).setOrigin(0).setDepth(2);
+    this.road = this.add.tileSprite(0,GROUND,W,70,'road'+TH).setOrigin(0).setDepth(3);
+
+    /* player */
+    this.player = this.add.container(PX, GROUND).setDepth(7);
+    const hl = this.add.graphics(); hl.fillStyle(C.amber, day?0.05:0.08); hl.fillTriangle(28,-16,150,-2,150,-34);
+    this.veh = this.add.image(0,0,'veh_'+p.vehicle).setOrigin(0.5,1).setScale(0.5);
+    this.beacon = this.add.circle(4,-60,4,C.amber).setAlpha(0.9);
+    this.player.add([hl, this.veh, this.beacon]);
+    if (!REDUCED) this.tweens.add({targets:this.beacon, alpha:0.15, duration:500, yoyo:true, repeat:-1});
+    this.pVelY = 0; this.onGround = true; this.duckHeld = false; this.duckPointer = false;
+
+    /* HUD */
+    const bar = this.add.graphics().setDepth(10);
+    bar.fillStyle(C.bg2,0.88); bar.fillRect(0,0,W,46); bar.lineStyle(1,C.line,1); bar.lineBetween(0,46,W,46);
+    this.distText = T(this, 16, 9, '0 m', 22, S.text, {fontFamily:F.mono, fontStyle:'bold'}).setDepth(10);
+    coinIcon(this, 208, 24, 0.9).setDepth(10);
+    this.coinText = T(this, 224, 12, '0', 18, S.amber, {fontFamily:F.mono, fontStyle:'bold'}).setDepth(10);
+    this.streakText = T(this, 480, 23, '', 15, S.teal, {fontFamily:F.mono, fontStyle:'bold'}).setOrigin(0.5).setDepth(10);
+    this.lvText = T(this, W-88, 23, 'LV '+Profile.level(), 15, S.violet, {fontFamily:F.mono, fontStyle:'bold'}).setOrigin(0.5).setDepth(10);
+    this.hatIcons = [];
+    for (let i=0;i<this.maxHats;i++) this.hatIcons.push(this.add.image(W-136-i*30, 23, 'hat').setScale(0.5).setDepth(10));
+    const pauseBtn = makeBtn(this, W-32, 23, 34, 34, 'II', ()=>this.togglePause(), {size:13}); pauseBtn.setDepth(10);
+    this.tipText = T(this, 480, 66, '', 14, S.amber, {fontStyle:'bold', stroke:S.dark, strokeThickness:4}).setOrigin(0.5).setDepth(11).setAlpha(0);
+
+    if (p.stats.runs < 3){
+      const hint = T(this, 480, 130, 'SPACE / TAP RIGHT — JUMP        DOWN / HOLD LEFT — DUCK', 15, S.text, {fontStyle:'bold', stroke:S.dark, strokeThickness:4}).setOrigin(0.5).setDepth(11);
+      this.tweens.add({targets:hint, alpha:0, delay:3200, duration:600, onComplete:()=>hint.destroy()});
+    }
+
+    /* input */
+    const kb = this.input.keyboard;
+    kb.on('keydown-SPACE', e=>{ e.preventDefault(); this.jump(); });
+    kb.on('keydown-UP',    ()=>this.jump());
+    kb.on('keydown-DOWN',  ()=>{ this.duckHeld = true; });
+    kb.on('keyup-DOWN',    ()=>{ this.duckHeld = false; });
+    kb.on('keydown-P',     ()=>this.togglePause());
+    kb.on('keydown-ESC',   ()=>this.togglePause());
+    this.input.on('pointerdown', pt=>{
+      const px2 = pt.worldX !== undefined ? pt.worldX : pt.x, py = pt.worldY !== undefined ? pt.worldY : pt.y;
+      if (this.state !== 'run' || py < 50) return;
+      Snd.ensure();
+      if (px2 < W*0.38) this.duckPointer = true; else this.jump();
+    });
+    this.input.on('pointerup', ()=>{ this.duckPointer = false; });
+    this.events.on('shutdown', ()=>kb.removeAllListeners());
+  }
+
+  jump(){
+    if (this.state !== 'run' || !this.onGround) return;
+    this.pVelY = BAL.jumpVel; this.onGround = false; Snd.jump();
+  }
+
+  update(time, deltaMs){
+    if (this.state !== 'run') return;
+    const slow = time < this.slowUntil ? 0.45 : 1;
+    const dt = Math.min(deltaMs, 50)/1000 * slow;
+    this.speed = Math.min(Profile.startSpeed() + this.meters*Profile.ramp(),
+                          Profile.maxSpeed() + this.meters*BAL.creep) * this.D.speed;
+    const v = this.speed;
+    this.dist += v*dt; this.meters = this.dist/BAL.pxPerMeter;
+
+    this.far.tilePositionX  = this.dist*0.08;
+    this.midL.tilePositionX = this.dist*0.18;
+    this.fen.tilePositionX  = this.dist*0.55;
+    this.road.tilePositionX = this.dist;
+
+    /* player physics */
+    const ducking = (this.duckHeld || this.duckPointer) && this.onGround;
+    this.player.scaleY += ((ducking?0.6:1) - this.player.scaleY) * Math.min(1, dt*20);
+    if (!this.onGround){
+      if (this.duckHeld || this.duckPointer) this.pVelY += BAL.fastFall*dt;
+      this.pVelY += BAL.gravity*dt;
+      this.player.y += this.pVelY*dt;
+      if (this.player.y >= GROUND){ this.player.y = GROUND; this.pVelY = 0; this.onGround = true; }
+      this.veh.rotation = this.pVelY < 0 ? -0.07 : 0.06;
+    } else {
+      this.veh.rotation = 0;
+      this.veh.y = Math.sin(time/90)*1.5;
+    }
+
+    /* spawn: obstacles, coins, gates */
+    const lead = 1060 - PX;                       // px of travel before a spawn meets the player
+    const gatePx = this.nextGateM * BAL.pxPerMeter;
+    if (this.dist >= this.nextObsDist){
+      const worldPos = this.dist + lead;
+      if (Math.abs(worldPos - gatePx) < 450) this.nextObsDist = this.dist + 520;
+      else { this.spawnObstacle(); this.nextObsDist = this.dist + (v*rand(0.78, 1.35) + 150) * this.D.gap; }
+    }
+    if (this.dist >= this.nextCoinDist){
+      const worldPos = this.dist + lead;
+      if (Math.abs(worldPos - gatePx) < 380) this.nextCoinDist = this.dist + 420;
+      else { this.spawnCoins(); this.nextCoinDist = this.dist + rand(BAL.coinRowMinM, BAL.coinRowMaxM)*BAL.pxPerMeter; }
+    }
+    if (this.gateSpawnedFor !== this.nextGateM && this.dist >= gatePx - lead) this.spawnGate();
+
+    /* move + collide */
+    const ph = 56*this.player.scaleY - 8;
+    const py2 = this.player.y, py1 = py2 - ph;
+    const px1 = PX-30, px2 = PX+30;
+    for (let i=this.obstacles.length-1; i>=0; i--){
+      const o = this.obstacles[i];
+      o.x -= v*dt; o.img.x = o.x;
+      if (o.x < -170){ o.img.destroy(); this.obstacles.splice(i,1); continue; }
+      if (o.hit) continue;
+      const ox1 = o.x+4, ox2 = o.x + o.def.w - 4;
+      let oy1, oy2;
+      if (o.def.kind === 'jump'){ oy1 = GROUND - o.def.h; oy2 = GROUND; }
+      else { oy1 = 0; oy2 = DUCK_BOTTOM; }
+      if (px1 < ox2 && px2 > ox1 && py1 < oy2 && py2 > oy1 && time > this.invulnUntil){
+        o.hit = true; this.nearMiss(o, time);
+        if (this.state !== 'run') return;
+      }
+    }
+    for (let i=this.coinsArr.length-1; i>=0; i--){
+      const c = this.coinsArr[i];
+      c.x -= v*dt; c.img.x = c.x;
+      if (c.x < -30){ c.img.destroy(); this.coinsArr.splice(i,1); continue; }
+      if (Math.abs(c.x-PX) < 32 && c.y > py1-14 && c.y < py2+10){
+        this.coinsArr.splice(i,1);
+        this.coinsPickups += BAL.coinVal; Snd.coin();
+        this.tweens.add({targets:c.img, y:c.img.y-26, alpha:0, duration:240, onComplete:()=>c.img.destroy()});
+        this.refreshHUD();
+      }
+    }
+    for (let i=this.gates.length-1; i>=0; i--){
+      const gt = this.gates[i];
+      gt.x -= v*dt; gt.ct.x = gt.x;
+      if (gt.x < -200){ gt.ct.destroy(); this.gates.splice(i,1); continue; }
+      if (!gt.done && gt.x + 65 <= PX){ gt.done = true; this.askQuestion(); return; }
+    }
+    this.refreshHUD();
+  }
+
+  refreshHUD(){
+    this.distText.setText(fmt(this.meters)+' m');
+    this.coinText.setText(fmt(this.coinsGates + this.coinsPickups));
+    this.streakText.setText(this.streak >= 2 ? 'STREAK ×'+this.streak : '');
+    this.hatIcons.forEach((h,i)=>h.setAlpha(i < this.hats ? 1 : 0.22));
+    this.lvText.setText('LV '+Profile.level());
+  }
+
+  spawnObstacle(){
+    const av = OBS.filter(o=>this.meters >= o.minM);
+    const ducks = av.filter(o=>o.kind==='duck'), jumps = av.filter(o=>o.kind==='jump');
+    const def = (ducks.length && Math.random() < 0.35) ? pick(ducks) : pick(jumps);
+    let img;
+    if (def.kind === 'duck')        img = this.add.image(1060, 0, 'obs_'+def.id).setOrigin(0,0).setScale(0.5).setDepth(6);
+    else if (def.id === 'trench')   img = this.add.image(1060, GROUND+16, 'obs_'+def.id).setOrigin(0,1).setScale(0.5).setDepth(6);
+    else                            img = this.add.image(1060, GROUND, 'obs_'+def.id).setOrigin(0,1).setScale(0.5).setDepth(6);
+    this.obstacles.push({def, img, x:1060, hit:false});
+  }
+  spawnCoins(){
+    const n = irand(3,5), y = pick([GROUND-26, GROUND-62, GROUND-100]);
+    for (let i=0;i<n;i++){
+      const x = 1060 + i*28;
+      this.coinsArr.push({x, y, img:this.add.image(x, y, 'coin').setScale(0.5).setDepth(5)});
+    }
+  }
+  spawnGate(){
+    this.gateSpawnedFor = this.nextGateM;
+    const ct = this.add.container(1060, GROUND-232).setDepth(4);
+    ct.add(this.add.image(0,0,'gate').setOrigin(0).setScale(0.5));
+    ct.add(T(this, 65, 38, 'CHECKPOINT', 13, S.teal, {fontFamily:F.mono, fontStyle:'bold'}).setOrigin(0.5));
+    this.gates.push({x:1060, ct, done:false});
+  }
+
+  nearMiss(o, time){
+    if (this.hats > 0){
+      this.hats--; Snd.hit();
+      this.invulnUntil = time + BAL.invulnMs; this.slowUntil = time + BAL.slowmoMs;
+      this.tipText.setText('NEAR-MISS — '+o.def.tip).setAlpha(1);
+      this.tweens.add({targets:this.tipText, alpha:0, delay:2200, duration:500});
+      if (!REDUCED) this.cameras.main.shake(130, 0.004);
+      const flash = this.add.rectangle(W/2,H/2,W,H,C.coral,0.18).setDepth(9);
+      this.tweens.add({targets:flash, alpha:0, duration:300, onComplete:()=>flash.destroy()});
+      this.tweens.add({targets:this.player, alpha:0.35, duration:130, yoyo:true, repeat:4, onComplete:()=>this.player.setAlpha(1)});
+      this.refreshHUD();
+    } else {
+      this.endShift(o);
+    }
+  }
+
+  /* ---- checkpoint question (learning gate) ---- */
+  askQuestion(){
+    this.state = 'question';
+    const q = nextQuestion(this.gateIdx, this.sess);
+    this.gateIdx++;
+    this.lastQ = q;
+    this.buildCard(q);
+  }
+  buildCard(q){
+    const ct = this.add.container(0,0).setDepth(20);
+    this.card = ct;
+    ct.add(this.add.rectangle(W/2,H/2,W,H,C.dark,0.66).setInteractive());
+    const choices = shuffle(q.choices);
+    const prompt = T(this, W/2, 0, q.question, 17, S.text, {fontStyle:'bold', wordWrap:{width:552}, align:'center'}).setOrigin(0.5,0);
+    const promptH = prompt.height;
+    const n = choices.length;
+    const panelH = 104 + promptH + 16 + n*52 + 92;
+    const y0 = Math.max(30, (H-panelH)/2);
+    ct.add(makePanel(this, W/2-310, y0, 620, panelH, {fill:C.bg2, alpha:0.98}));
+    /* header: category + difficulty, mastery pips */
+    const cat = (q.category||'GEN'), diff = q.difficulty||'medium';
+    const dcol = diff==='easy'?C.green:diff==='hard'?C.coral:C.amber;
+    const hdr = this.add.graphics();
+    hdr.fillStyle(C.panel,1); hdr.fillRoundedRect(W/2-286, y0+18, 150, 26, 6);
+    hdr.fillStyle(dcol,1); hdr.fillCircle(W/2-272, y0+31, 5);
+    ct.add(hdr);
+    ct.add(T(this, W/2-260, y0+24, cat+' · '+diff.toUpperCase(), 12, S.muted, {fontFamily:F.mono}));
+    ct.add(T(this, W/2, y0+24, 'CHECKPOINT '+this.gateIdx, 13, S.teal, {fontFamily:F.mono, fontStyle:'bold'}).setOrigin(0.5,0));
+    const m = Profile.data.mastery[qKey(q)] || {s:0, need:2, m:false};
+    const pips = this.add.graphics(); ct.add(pips);
+    if (m.m){ ct.add(T(this, W/2+284, y0+22, '★ MASTERED', 13, S.teal, {fontFamily:F.mono, fontStyle:'bold'}).setOrigin(1,0)); }
+    else for (let i=0;i<m.need;i++){
+      const px2 = W/2+284 - (m.need-i)*17;
+      if (i < m.s){ pips.fillStyle(C.teal,1); pips.fillRoundedRect(px2, y0+20, 12, 18, 3); }
+      else { pips.lineStyle(1.5,C.line,1); pips.strokeRoundedRect(px2, y0+20, 12, 18, 3); }
+    }
+    prompt.setY(y0+62); ct.add(prompt);
+    const cy0 = y0 + 62 + promptH + 18;
+    const btns = [];
+    let locked = false;
+    this.cardAnswered = false;
+    choices.forEach((choice,i)=>{
+      const b = makeBtn(this, W/2, cy0 + i*52 + 22, 560, 44, choice, ()=>{
+        if (locked) return; locked = true;
+        this.resolveAnswer(q, choice, choices, btns, ct, cy0, y0, panelH);
+      }, {size:15, bold:false});
+      btns.push(b); ct.add(b);
+    });
+  }
+  resolveAnswer(q, choice, choices, btns, ct, cy0, y0, panelH){
+    const correct = choice === q.answer;
+    this.qa++; if (correct) this.qc++;
+    const newly = recordAnswer(q, correct);
+    let xpAdd = BAL.xpGate, reward = '';
+    if (correct){
+      this.sess.correct.add(qKey(q));
+      this.streak++; this.bestStreak = Math.max(this.bestStreak, this.streak);
+      const pay = Math.round(BAL.gateGold[Math.min(this.streak-1, BAL.gateGold.length-1)] * this.D.coin);
+      this.coinsGates += pay;
+      reward = '+'+pay+' coins' + (this.streak>1 ? '  ·  streak ×'+this.streak : '');
+      if (this.hats < this.maxHats){ this.hats++; reward += '  ·  hard hat restored'; }
+      xpAdd += BAL.xpCorrect; this.xpAns += BAL.xpCorrect;
+      if (newly){ xpAdd += BAL.xpMaster; this.xpMast += BAL.xpMaster; this.masteredRun++; reward += '  ·  ★ mastered'; }
+      Snd.ok();
+    } else {
+      this.streak = 0;
+      reward = 'No coins this time — streak reset.';
+      Snd.no();
+    }
+    const leveled = Profile.addXP(xpAdd);
+    Profile.save();
+    /* mark buttons */
+    const mark = this.add.graphics(); ct.add(mark);
+    choices.forEach((c,i)=>{
+      const by = cy0 + i*52 + 22;
+      if (c === q.answer){ mark.lineStyle(2.5, C.green, 1); mark.strokeRoundedRect(W/2-280, by-22, 560, 44, 10); }
+      else if (c === choice){ mark.lineStyle(2.5, C.coral, 1); mark.strokeRoundedRect(W/2-280, by-22, 560, 44, 10); }
+    });
+    btns.forEach(b=>b.setEnabled(false));
+    btns[choices.indexOf(q.answer)].setAlpha(1);
+    const fy = cy0 + choices.length*52 + 6;
+    ct.add(T(this, W/2, fy, reward, 14, correct?S.green:S.coral, {fontStyle:'bold'}).setOrigin(0.5,0));
+    if (q.why) ct.add(T(this, W/2, fy+24, q.why, 13, S.muted, {wordWrap:{width:540}, align:'center', fontStyle:'italic'}).setOrigin(0.5,0));
+    if (leveled){
+      Snd.level();
+      ct.add(T(this, W/2, y0-24, 'LEVEL UP — LV '+Profile.level()+' · '+Profile.rank(), 16, S.violet, {fontStyle:'bold'}).setOrigin(0.5));
+    }
+    const go = makeBtn(this, W/2, y0+panelH-34, 200, 42, 'CONTINUE', ()=>this.closeCard(), {kind:'primary'});
+    ct.add(go);
+    this.cardAnswered = true;
+    this.input.keyboard.once('keydown-ENTER', ()=>{ if (this.state==='question' && this.cardAnswered) this.closeCard(); });
+    this.refreshHUD();
+  }
+  closeCard(){
+    if (!this.card) return;
+    this.card.destroy(); this.card = null;
+    this.gateSpacing = Math.min(BAL.gateMax, this.gateSpacing + BAL.gateStep);
+    this.nextGateM += this.gateSpacing;
+    this.resumeCountdown();
+  }
+  resumeCountdown(){
+    this.state = 'count';
+    const seq = REDUCED ? ['GO'] : ['3','2','1'];
+    let i = 0;
+    const step = ()=>{
+      if (i >= seq.length){ this.state = 'run'; return; }
+      const t = T(this, 480, 240, seq[i], 54, S.teal, {fontStyle:'bold', fontFamily:F.mono, stroke:S.dark, strokeThickness:6}).setOrigin(0.5).setDepth(21);
+      this.tweens.add({targets:t, alpha:0, scale:1.5, duration:330, onComplete:()=>t.destroy()});
+      i++; this.time.delayedCall(340, step);
+    };
+    step();
+  }
+
+  togglePause(){
+    if (this.state === 'run'){
+      this.state = 'pause';
+      const ct = this.add.container(0,0).setDepth(30);
+      ct.add(this.add.rectangle(W/2,H/2,W,H,C.dark,0.7).setInteractive());
+      ct.add(makePanel(this, W/2-170, 160, 340, 230, {fill:C.bg2, alpha:0.98}));
+      ct.add(T(this, W/2, 196, 'PAUSED', 26, S.text, {fontStyle:'bold'}).setOrigin(0.5));
+      ct.add(makeBtn(this, W/2, 250, 240, 44, 'RESUME', ()=>{ ct.destroy(); this.pauseCt=null; this.state='run'; }, {kind:'primary'}));
+      const snd = makeBtn(this, W/2, 302, 240, 40, 'SOUND: '+(Profile.data.mute?'OFF':'ON'), ()=>{
+        Profile.data.mute = !Profile.data.mute; Profile.save();
+        snd.setLabel('SOUND: '+(Profile.data.mute?'OFF':'ON'));
+      });
+      ct.add(snd);
+      ct.add(makeBtn(this, W/2, 350, 240, 40, 'QUIT TO MENU', ()=>{ ct.destroy(); this.scene.start('Menu'); }, {kind:'danger'}));
+      this.pauseCt = ct;
+    } else if (this.state === 'pause'){
+      if (this.pauseCt){ this.pauseCt.destroy(); this.pauseCt = null; }
+      this.state = 'run';
+    }
+  }
+
+  endShift(o){
+    if (this.state === 'over') return;
+    this.state = 'over';
+    Snd.over(); Snd.hit();
+    if (!REDUCED) this.cameras.main.shake(220, 0.006);
+    this.veh.setTint(0xF87171);
+    this.tipText.setText('NEAR-MISS — '+o.def.tip).setAlpha(1);
+    const meters = Math.floor(this.meters);
+    const distCoins = Math.round(Math.floor(meters / BAL.distCoinPer) * this.D.coin);
+    const total = this.coinsGates + this.coinsPickups + distCoins;
+    const p = Profile.data;
+    p.coins += total;
+    const xpDist = Math.floor(meters/100) * BAL.xpPer100m;
+    const newBest = meters > p.best;
+    const xpBest = newBest ? BAL.xpBest : 0;
+    if (newBest) p.best = meters;
+    const lvBefore = Profile.level();
+    Profile.addXP(xpDist + xpBest);
+    p.stats.runs++; p.stats.meters += meters; p.stats.coins += total;
+    Profile.save();
+    const data = {
+      meters, coinsGates:this.coinsGates, coinsPickups:this.coinsPickups, distCoins, total,
+      qa:this.qa, qc:this.qc, bestStreak:this.bestStreak, masteredRun:this.masteredRun, diffLabel:this.D.label,
+      xpAns:this.xpAns, xpMast:this.xpMast, xpDist, xpBest, newBest,
+      lvBefore, lvAfter:Profile.level()
+    };
+    this.time.delayedCall(950, ()=>this.scene.start('Over', data));
+  }
+}
+
+/* =========================================================================
+   SHIFT COMPLETE — recap, XP, level bar
+   ========================================================================= */
+class OverScene extends Phaser.Scene {
+  constructor(){ super('Over'); }
+  init(data){ this.d = data; this.sys.settings.data = {}; }
+  create(){
+    const d = this.d;
+    setupCam(this);
+    const TH = themeSfx();
+    this.add.image(0,0,'sky'+TH).setOrigin(0);
+    this.add.tileSprite(0,190,W,180,'skyline'+TH).setOrigin(0);
+    this.add.tileSprite(0,GROUND,W,70,'road'+TH).setOrigin(0);
+    this.add.rectangle(W/2,H/2,W,H,C.dark,0.55);
+    makePanel(this, 210, 40, 540, 460, {fill:C.bg2, alpha:0.98});
+    T(this, W/2, 72, 'SHIFT COMPLETE', 30, S.amber, {fontStyle:'bold'}).setOrigin(0.5);
+    T(this, W/2, 102, pick(['Every near-miss is a lesson.','Safe site, strong score.','The best crews learn every shift.','Report it, fix it, run it again.']), 13, S.muted).setOrigin(0.5);
+
+    if (d.newBest){
+      const nb = T(this, W/2, 128, 'NEW SITE BEST', 15, S.amber, {fontStyle:'bold', fontFamily:F.mono}).setOrigin(0.5);
+      if (!REDUCED) this.tweens.add({targets:nb, alpha:0.4, duration:500, yoyo:true, repeat:-1});
+    }
+    T(this, W/2, 168, fmt(d.meters)+' m', 42, S.text, {fontStyle:'bold', fontFamily:F.mono}).setOrigin(0.5);
+    if (d.diffLabel) T(this, W/2, 196, d.diffLabel+' SHIFT', 12, S.muted, {fontFamily:F.mono}).setOrigin(0.5);
+
+    const rows = [];
+    rows.push(['Coins earned', '+'+fmt(d.total)+'   (checkpoints '+d.coinsGates+' · pickups '+d.coinsPickups+' · distance '+d.distCoins+')']);
+    rows.push(['Questions', d.qc+' correct of '+d.qa + (d.bestStreak>1 ? '   ·   best streak ×'+d.bestStreak : '')]);
+    if (d.masteredRun > 0) rows.push(['Mastered this shift', '★ '+d.masteredRun]);
+    const xpTotal = d.xpAns + d.xpMast + d.xpDist + d.xpBest + d.qa*BAL.xpGate;
+    const xpParts = [];
+    if (d.xpAns+d.qa*BAL.xpGate>0) xpParts.push('answers +'+(d.xpAns+d.qa*BAL.xpGate));
+    if (d.xpMast>0) xpParts.push('mastery +'+d.xpMast);
+    if (d.xpDist>0) xpParts.push('distance +'+d.xpDist);
+    if (d.xpBest>0) xpParts.push('site best +'+d.xpBest);
+    rows.push(['XP gained', '+'+xpTotal+ (xpParts.length ? '   ('+xpParts.join(' · ')+')' : '')]);
+    rows.forEach(([k,v],i)=>{
+      T(this, 250, 212+i*36, k, 14, S.muted);
+      T(this, 250, 230+i*36, v, 14, S.text, {fontFamily:F.mono});
+    });
+
+    /* level bar */
+    const lv = Profile.level(), p = Profile.data;
+    const cur = xpTotalFor(lv), next = xpTotalFor(lv+1);
+    const pct = clamp((p.xp-cur)/(next-cur), 0, 1);
+    const by = 212 + rows.length*36 + 14;
+    T(this, 250, by, 'LV '+lv+' · '+Profile.rank() + (d.lvAfter>d.lvBefore ? '   — LEVEL UP' : ''), 15, S.violet, {fontStyle:'bold'});
+    const bg = this.add.graphics();
+    bg.fillStyle(C.line,1); bg.fillRoundedRect(250, by+26, 460, 12, 6);
+    const fill = this.add.graphics();
+    const anim = {v:0};
+    this.tweens.add({targets:anim, v:pct, duration:REDUCED?0:800, ease:'Cubic.out', onUpdate:()=>{
+      fill.clear(); fill.fillStyle(C.violet,1); fill.fillRoundedRect(250, by+26, Math.max(10,460*anim.v), 12, 6);
+    }});
+    T(this, 710, by, fmt(next-p.xp)+' xp to LV '+(lv+1), 12, S.muted, {fontFamily:F.mono}).setOrigin(1,0);
+
+    makeBtn(this, W/2-118, 462, 210, 48, 'RUN AGAIN', ()=>this.scene.start('Play', {}), {kind:'primary', size:17});
+    makeBtn(this, W/2+118, 462, 210, 48, 'MENU', ()=>this.scene.start('Menu'), {size:16});
+    this.input.keyboard.on('keydown-SPACE', ()=>this.scene.start('Play', {}));
+    this.input.keyboard.on('keydown-ENTER', ()=>this.scene.start('Play', {}));
+  }
+}
+
+/* ---- boot the game ---- */
+const game = new Phaser.Game({
+  type: Phaser.AUTO,
+  parent: 'game',
+  width: W*2, height: H*2,   // rendered at 2x and zoomed — crisp on large/high-DPI displays
+  backgroundColor: '#0D1526',
+  render: {
+    antialias: true,
+    roundPixels: true,               // snap draws to device pixels — no subpixel smearing on moving objects
+    powerPreference: 'high-performance',
+    desynchronized: true             // lower-latency canvas presentation where supported
+  },
+  fps: { min: 20, smoothStep: true },// uncapped rAF — runs at the monitor's full refresh rate (60/120/144 Hz)
+  scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
+  scene: [BootScene, MenuScene, PlayScene, OverScene]
+});
+
+/* testing hook */
+window.__dbg = { game, BAL, RANKS, VEHICLES, OBS, C, Profile, Bank, SAMPLE_QUESTIONS, qKey, parseQuestionFile, validateRows, nextQuestion, makeSession, levelFromXP, xpTotalFor, Store };
+</script>
+</body>
+</html>
